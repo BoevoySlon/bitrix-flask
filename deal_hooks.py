@@ -226,4 +226,165 @@ def lists_element_get_by_prop(prop_tag: str, value: str) -> List[Dict[str, Any]]
             continue
 
     # GET query-style
-    attempts_get_
+    attempts_get = [
+        {**base, f"filter[={prop_tag}]": value},
+        {**base, f"filter[{prop_tag}]": value},
+        {**base, f"filter[{prop_tag.replace('PROPERTY_', '', 1)}]": value},
+        {**base, f"filter[={prop_tag.replace('PROPERTY_', '', 1)}]": value},
+    ]
+    for params in attempts_get:
+        try:
+            data = bx_get("lists.element.get", params)
+            res = data.get("result") or []
+            if res:
+                return res
+        except requests.HTTPError:
+            continue
+
+    return []
+
+def find_list_element_by_keys(product_id: Any, search_keys: List[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    val = str(product_id).strip()
+    for tag in search_keys:
+        res = lists_element_get_by_prop(tag, val)
+        if res:
+            return res[0], tag
+    return None, None
+
+
+# ====== HTTP-хук ======
+@bp.route("/hooks/deal-update", methods=["POST"])
+def on_deal_update():
+    # Секрет
+    secret = request.args.get("secret")
+    if INBOUND_SECRET and secret != INBOUND_SECRET:
+        abort(403, description="forbidden")
+
+    # Отладка
+    debug_mode = (request.args.get("debug", "").lower() in ("1", "true", "yes", "y"))
+    dry_run    = (request.args.get("dry_run", "").lower() in ("1", "true", "yes", "y"))
+
+    try:
+        payload = request.get_json(silent=True) or {}
+        deal_id = (
+            payload.get("data", {}).get("FIELDS", {}).get("ID")
+            or payload.get("FIELDS", {}).get("ID")
+            or payload.get("deal_id")
+        )
+        if not deal_id:
+            return jsonify({"status": "skip", "reason": "no deal id"}), 200
+        deal_id = int(deal_id)
+
+        # 0) Получаем теги полей
+        search_tags, value_tags, fields_dbg = resolve_field_ids()
+
+        # 1) Товары сделки
+        rows = get_deal_products(deal_id)
+        if not rows:
+            body = {"status": "skip", "reason": "no products"}
+            if debug_mode:
+                body["fields_dbg"] = fields_dbg
+            return jsonify(body), 200
+
+        found_dates: List[str] = []
+        debug_matches: List[Dict[str, Any]] = []
+
+        for row in rows:
+            product_id = row.get("PRODUCT_ID")
+            if not product_id:
+                continue
+
+            p = get_product_info(product_id)
+            xml_id = p.get("XML_ID")
+            code   = p.get("CODE")
+
+            el, matched_tag = find_list_element_by_keys(product_id, search_tags)
+            if not el:
+                debug_matches.append({
+                    "product_id": product_id, "xml_id": xml_id, "code": code,
+                    "match": None
+                })
+                continue
+
+            date_value, date_from_key = extract_value_prop(el, value_tags)
+            debug_entry = {
+                "product_id": product_id,
+                "xml_id": xml_id,
+                "code": code,
+                "match": matched_tag,
+                "date": date_value,
+                "date_from_key": date_from_key
+            }
+            if debug_mode:
+                debug_entry["el_keys"] = [k for k in el.keys() if k.startswith("PROPERTY_") or k in ("ID", "NAME")]
+
+            debug_matches.append(debug_entry)
+
+            if date_value:
+                found_dates.append(date_value)
+
+        if not found_dates:
+            body = {
+                "status": "skip",
+                "reason": "date_property_missing",
+                "hint": f"Проверьте поле даты в списке #{LIST_ID} (FIELD_ID/CODE/имя)."
+            }
+            if debug_mode:
+                body["debug"] = debug_matches
+                body["fields_dbg"] = fields_dbg
+            return jsonify(body), 200
+
+        # 2) Берём минимальную дату
+        def parse_iso_date(s: str) -> Optional[datetime]:
+            try:
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+                    return datetime.fromisoformat(s)
+                return datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        parsed = [parse_iso_date(d) for d in found_dates if d]
+        parsed = [p for p in parsed if p]
+        if not parsed:
+            return jsonify({"status": "skip", "reason": "dates invalid"}), 200
+
+        final_date = min(parsed).date().isoformat()
+
+        current = get_deal_field(deal_id, TARGET_DEAL_FIELD)
+        current_norm = normalize_date_yyyy_mm_dd(current) if current else ""
+        if (current_norm or "") == final_date:
+            resp = {"status": "ok", "updated": False, "note": "no change", "value": final_date}
+            if debug_mode:
+                matched = [m for m in debug_matches if m.get("date")]
+                resp["matched_product_ids"] = [m["product_id"] for m in matched]
+                resp["matched_products"] = matched
+                resp["fields_dbg"] = fields_dbg
+            return jsonify(resp), 200
+
+        if dry_run:
+            resp = {"status": "ok", "updated": False, "note": "dry_run", "value": final_date}
+            if debug_mode:
+                matched = [m for m in debug_matches if m.get("date")]
+                resp["matched_product_ids"] = [m["product_id"] for m in matched]
+                resp["matched_products"] = matched
+                resp["fields_dbg"] = fields_dbg
+            return jsonify(resp), 200
+
+        ok = update_deal_field(deal_id, TARGET_DEAL_FIELD, final_date)
+        resp = {"status": "ok", "updated": ok, "value": final_date}
+        if debug_mode:
+            matched = [m for m in debug_matches if m.get("date")]
+            resp["matched_product_ids"] = [m["product_id"] for m in matched]
+            resp["matched_products"] = matched
+            resp["fields_dbg"] = fields_dbg
+        return jsonify(resp), 200
+
+    except RequestsTimeout as e:
+        log.warning("Bitrix REST timeout: %s", e)
+        return jsonify({"status": "retry_later", "reason": "bitrix timeout"}), 200
+    except RequestException as e:
+        log.exception("Bitrix REST request error")
+        return jsonify({"status": "error_remote", "detail": str(e)}), 200
+    except Exception as e:
+        log.exception("Unhandled")
+        return jsonify({"status": "error", "detail": str(e)}), 500
