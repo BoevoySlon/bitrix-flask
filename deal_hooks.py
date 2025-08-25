@@ -2,8 +2,8 @@
 import os
 import re
 import logging
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -32,6 +32,29 @@ SEARCH_PROP = "PROPERTY_204"             # ищем по этому свойст
 DATE_PROP   = "PROPERTY_202"             # берём дату из этого свойства
 TARGET_DEAL_FIELD = os.getenv("TARGET_DEAL_FIELD", "UF_CRM_1755600973")
 
+# чекбокс-замок (если включён — поле даты не перезаписываем)
+LOCK_FIELD = os.getenv("MANUAL_LOCK_FIELD", "").strip()
+
+# уважать ручные правки N часов
+MANUAL_OVERRIDE_TTL_HOURS = int(os.getenv("MANUAL_OVERRIDE_TTL_HOURS", "24"))
+
+# ID интеграционного пользователя (из URL или env)
+def _parse_integration_user_id_from_url(url: str) -> Optional[int]:
+    m = re.search(r"/rest/(\d+)/", url)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+INTEGRATION_USER_ID = int(
+    os.getenv(
+        "BITRIX_USER_ID",
+        str(_parse_integration_user_id_from_url(BITRIX_URL)) if _parse_integration_user_id_from_url(BITRIX_URL) else "0",
+    ) or "0"
+)
+
 # Таймауты/ретраи HTTP (через ENV)
 CONNECT_TIMEOUT = float(os.getenv("BITRIX_CONNECT_TIMEOUT", "8"))
 READ_TIMEOUT    = float(os.getenv("BITRIX_READ_TIMEOUT", "30"))
@@ -56,40 +79,33 @@ adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
 SESSION.mount("https://", adapter)
 SESSION.mount("http://", adapter)
 
-# ===== Низкоуровневые вызовы REST =====
-def bx_get(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    r = SESSION.get(f"{BITRIX_URL}{method}", params=params, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+# ===== Утилиты =====
+def is_truthy(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    s = str(v).strip().lower()
+    return s in ("y", "yes", "true", "1", "on")
 
-def bx_post(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    r = SESSION.post(f"{BITRIX_URL}{method}", json=payload, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+def normalize_date_yyyy_mm_dd(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    s = s.strip()
+    m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", s)
+    if m:
+        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.date().isoformat()
+    except Exception:
+        return None
 
-def bx_post_form(method: str, data_pairs: List[Tuple[str, str]]) -> Dict[str, Any]:
-    """
-    application/x-www-form-urlencoded, чтобы честно передавать select[]=... и filter[...]=...
-    """
-    r = SESSION.post(f"{BITRIX_URL}{method}", data=data_pairs, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.json()
-
-# ===== CRM =====
-def get_deal_products(deal_id: int) -> List[Dict[str, Any]]:
-    data = bx_get("crm.deal.productrows.get", {"id": deal_id})
-    return data.get("result") or []
-
-def get_deal_field(deal_id: int, field: str) -> Optional[Any]:
-    data = bx_get("crm.deal.get", {"id": deal_id})
-    res = data.get("result") or {}
-    return res.get(field)
-
-def update_deal_field(deal_id: int, field: str, value: Any) -> bool:
-    data = bx_post("crm.deal.update", {"id": deal_id, "fields": {field: value}})
-    return bool(data.get("result") is True)
-
-# ===== Вспомогательные функции для списков =====
 def _first_entry_value(obj: Any) -> Optional[Any]:
     if obj is None:
         return None
@@ -101,13 +117,6 @@ def _first_entry_value(obj: Any) -> Optional[Any]:
     return obj
 
 def _flatten_scalar(x: Any) -> Optional[str]:
-    """
-    Универсальная распаковка значений Bitrix:
-    - строка -> строка
-    - {"VALUE": "..."} / {"TEXT":"..."} / вложенные dict -> строка
-    - {"1616":"..."} (assoc) -> значение
-    - [ ... ] -> первый непустой элемент
-    """
     if x is None:
         return None
     if isinstance(x, (list, tuple)):
@@ -130,29 +139,39 @@ def _flatten_scalar(x: Any) -> Optional[str]:
     s = str(x).strip()
     return s or None
 
-def normalize_date_yyyy_mm_dd(s: Optional[str]) -> Optional[str]:
-    if not s:
-        return None
-    s = s.strip()
-    m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", s)
-    if m:
-        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
-    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    try:
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return dt.date().isoformat()
-    except Exception:
-        return None
+# ===== REST =====
+def bx_get(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    r = SESSION.get(f"{BITRIX_URL}{method}", params=params, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
 
+def bx_post(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    r = SESSION.post(f"{BITRIX_URL}{method}", json=payload, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+def bx_post_form(method: str, data_pairs: List[tuple[str, str]]) -> Dict[str, Any]:
+    r = SESSION.post(f"{BITRIX_URL}{method}", data=data_pairs, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+# ===== CRM =====
+def get_deal_products(deal_id: int) -> List[Dict[str, Any]]:
+    data = bx_get("crm.deal.productrows.get", {"id": deal_id})
+    return data.get("result") or []
+
+def get_deal_info(deal_id: int) -> Dict[str, Any]:
+    data = bx_get("crm.deal.get", {"id": deal_id})
+    return data.get("result") or {}
+
+def update_deal_field(deal_id: int, field: str, value: Any) -> bool:
+    data = bx_post("crm.deal.update", {"id": deal_id, "fields": {field: value}})
+    return bool(data.get("result") is True)
+
+# ===== Lists =====
 def fetch_elements_by_product_id(product_id: Any) -> List[Dict[str, Any]]:
-    """
-    Form-POST: filter[=PROPERTY_204]=<product_id>, select[]=PROPERTY_202/204
-    Возвращаем элементы как есть (уже со свойствами).
-    """
     pid = str(product_id).strip()
-    data_pairs: List[Tuple[str, str]] = [
+    data_pairs: List[tuple[str, str]] = [
         ("IBLOCK_TYPE_ID", "lists"),
         ("IBLOCK_ID", str(LIST_ID)),
         (f"filter[={SEARCH_PROP}]", pid),
@@ -167,19 +186,13 @@ def fetch_elements_by_product_id(product_id: Any) -> List[Dict[str, Any]]:
     return data.get("result") or []
 
 def extract_date_for_product(elements: List[Dict[str, Any]], product_id: Any) -> Optional[str]:
-    """
-    Из списка элементов (уже с PROPERTY_202/204) находим тот, где PROPERTY_204 == product_id,
-    вытаскиваем дату из PROPERTY_202 и нормализуем.
-    """
     pid = str(product_id).strip()
     for el in elements:
-        # значение PROPERTY_204
-        raw_pid = el.get(f"{SEARCH_PROP}_VALUE", None)
+        raw_pid = el.get(f"{SEARCH_PROP}_VALUE")
         if raw_pid is None:
-            raw_pid = el.get(SEARCH_PROP, None)
+            raw_pid = el.get(SEARCH_PROP)
             if isinstance(raw_pid, dict) and "VALUE" in raw_pid:
                 raw_pid = raw_pid["VALUE"]
-
         flat_pid = _flatten_scalar(raw_pid)
         if flat_pid != pid:
             if isinstance(el.get(SEARCH_PROP), dict):
@@ -189,10 +202,9 @@ def extract_date_for_product(elements: List[Dict[str, Any]], product_id: Any) ->
             else:
                 continue
 
-        # значение PROPERTY_202
-        raw_date = el.get(f"{DATE_PROP}_VALUE", None)
+        raw_date = el.get(f"{DATE_PROP}_VALUE")
         if raw_date is None:
-            raw_date = el.get(DATE_PROP, None)
+            raw_date = el.get(DATE_PROP)
             if isinstance(raw_date, dict) and "VALUE" in raw_date:
                 raw_date = raw_date["VALUE"]
 
@@ -202,14 +214,8 @@ def extract_date_for_product(elements: List[Dict[str, Any]], product_id: Any) ->
             return date_norm
     return None
 
-# ===== Разбор входящих вебхуков (JSON и form-urlencoded) =====
+# ===== Парсинг входа (JSON и form-urlencoded) =====
 def _extract_deal_id_from_request() -> Optional[int]:
-    """
-    Поддерживаем оба формата:
-    - JSON: {"data":{"FIELDS":{"ID":"..."}}, ...} или {"FIELDS":{"ID":"..."}}, {"deal_id": "..."}
-    - FORM: data[FIELDS][ID]=..., data[ID]=..., FIELDS[ID]=..., ID=...
-    """
-    # JSON
     payload = request.get_json(silent=True) or {}
     if isinstance(payload, dict):
         for getter in (
@@ -227,8 +233,6 @@ def _extract_deal_id_from_request() -> Optional[int]:
                     return int(v)
                 except Exception:
                     return None
-
-    # FORM
     form = request.form or {}
     if form:
         for key in ("data[FIELDS][ID]", "FIELDS[ID]", "data[ID]", "ID", "deal_id"):
@@ -243,7 +247,6 @@ def _extract_deal_id_from_request() -> Optional[int]:
 # ===== Основной хук =====
 @bp.route("/hooks/deal-update", methods=["POST"])
 def on_deal_update():
-    # защита секретом (?secret=...)
     secret = request.args.get("secret")
     if INBOUND_SECRET and secret != INBOUND_SECRET:
         abort(403, description="forbidden")
@@ -253,24 +256,21 @@ def on_deal_update():
         if not deal_id:
             return jsonify({"status": "skip", "reason": "no deal id"}), 200
 
+        # читаем сделку целиком (и для LOCK, и для инфо о редакторе)
+        deal = get_deal_info(deal_id)
+
+        # 1) LOCK: если выставлен чекбокс — не трогаем поле
+        if LOCK_FIELD:
+            lock_val = deal.get(LOCK_FIELD)
+            if is_truthy(lock_val):
+                return jsonify({"status": "skip", "reason": "locked"}), 200
+
+        # 2) получаем товары сделки
         rows = get_deal_products(deal_id)
         if not rows:
             return jsonify({"status": "skip", "reason": "no products"}), 200
 
-        dates: List[str] = []
-        for row in rows:
-            product_id = row.get("PRODUCT_ID")
-            if not product_id:
-                continue
-            els = fetch_elements_by_product_id(product_id)
-            d = extract_date_for_product(els, product_id)
-            if d:
-                dates.append(d)
-
-        if not dates:
-            return jsonify({"status": "skip", "reason": "date_property_missing"}), 200
-
-        # минимальная дата
+        # 3) вычисляем минимальную дату на основе списка
         def parse_iso(d: str) -> Optional[datetime]:
             try:
                 if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
@@ -279,21 +279,63 @@ def on_deal_update():
             except Exception:
                 return None
 
+        dates: List[str] = []
+        for row in rows:
+            pid = row.get("PRODUCT_ID")
+            if not pid:
+                continue
+            els = fetch_elements_by_product_id(pid)
+            d = extract_date_for_product(els, pid)
+            if d:
+                dates.append(d)
+        if not dates:
+            return jsonify({"status": "skip", "reason": "date_property_missing"}), 200
         parsed = [p for p in (parse_iso(d) for d in dates) if p]
         if not parsed:
             return jsonify({"status": "skip", "reason": "dates invalid"}), 200
         final_date = min(parsed).date().isoformat()
 
-        current = get_deal_field(deal_id, TARGET_DEAL_FIELD)
+        # 4) решаем — ставить или уважить недавнюю ручную правку
+        current = deal.get(TARGET_DEAL_FIELD)
         current_norm = normalize_date_yyyy_mm_dd(str(current) if current else "")
-        if (current_norm or "") == final_date:
+
+        if not current_norm:
+            ok = update_deal_field(deal_id, TARGET_DEAL_FIELD, final_date)
+            return jsonify({"status": "ok", "updated": ok, "value": final_date}), 200
+
+        if current_norm == final_date:
             return jsonify({"status": "ok", "updated": False, "value": final_date}), 200
 
+        modify_by = deal.get("MODIFY_BY_ID") or deal.get("UPDATED_BY_ID")
+        date_modify_raw = deal.get("DATE_MODIFY") or deal.get("DATE_UPDATE") or ""
+        dm = None
+        for s in (date_modify_raw, date_modify_raw.replace(" ", "T")):
+            try:
+                if s:
+                    dm = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                    break
+            except Exception:
+                dm = None
+
+        # если последним был интеграционный пользователь — перезаписываем
+        try:
+            if modify_by and int(modify_by) == INTEGRATION_USER_ID:
+                ok = update_deal_field(deal_id, TARGET_DEAL_FIELD, final_date)
+                return jsonify({"status": "ok", "updated": ok, "value": final_date}), 200
+        except Exception:
+            pass
+
+        # иначе уважаем ручную правку N часов
+        if dm:
+            age = datetime.utcnow() - dm.replace(tzinfo=None)
+            if age <= timedelta(hours=MANUAL_OVERRIDE_TTL_HOURS):
+                return jsonify({"status": "skip", "reason": "manual_recent_override", "value": current_norm}), 200
+
+        # TTL прошёл — перезаписываем
         ok = update_deal_field(deal_id, TARGET_DEAL_FIELD, final_date)
         return jsonify({"status": "ok", "updated": ok, "value": final_date}), 200
 
     except (RequestsTimeout, ReadTimeout, ConnectTimeout) as e:
-        # мягкая деградация при таймаутах
         log.warning("Bitrix REST timeout: %s", e)
         return jsonify({"status": "retry_later", "reason": "bitrix timeout"}), 200
     except RequestException as e:
@@ -302,11 +344,3 @@ def on_deal_update():
     except Exception as e:
         log.exception("Unhandled")
         return jsonify({"status": "error", "detail": str(e)}), 500
-
-# ===== (/hooks/spy и прочая отладка удалены)
-# @bp.route("/hooks/spy", methods=["GET","POST"])
-# def incoming_spy(): ...
-# @bp.route("/hooks/spy/last", methods=["GET"])
-# def incoming_spy_last(): ...
-# @bp.route("/hooks/spy/clear", methods=["POST"])
-# def incoming_spy_clear(): ...
