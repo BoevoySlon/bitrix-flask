@@ -6,11 +6,11 @@ from flask import Flask, request, jsonify, abort
 from werkzeug.middleware.proxy_fix import ProxyFix
 import requests
 
-from deal_hooks import bp as deal_hooks_bp
-app.register_blueprint(deal_hooks_bp)
-
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
+
+from deal_hooks import bp as deal_hooks_bp
+app.register_blueprint(deal_hooks_bp)
 
 # ==== конфигурация ====
 SCRIPTS_DIR = os.getenv("SCRIPTS_DIR", "/app/scripts")
