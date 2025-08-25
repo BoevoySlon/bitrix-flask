@@ -216,7 +216,35 @@ def extract_date_for_product(elements: List[Dict[str, Any]], product_id: Any, de
 
     return None, dbg
 
-# ===== HTTP-хук =====
+# ===== SPY: эхо-эндпоинт для отладки исходящих вебхуков =====
+@bp.route("/hooks/spy", methods=["GET", "POST"])
+def incoming_spy():
+    secret = request.args.get("secret")
+    if INBOUND_SECRET and secret != INBOUND_SECRET:
+        abort(403, description="forbidden")
+
+    # Попробуем распарсить JSON, но ничего не ломаем, если это form-POST
+    js = None
+    try:
+        js = request.get_json(silent=True)
+    except Exception:
+        js = None
+
+    resp = {
+        "status": "ok",
+        "method": request.method,
+        "path": request.path,
+        "query": request.args.to_dict(flat=False),
+        "headers": {k: v for k, v in request.headers.items()},
+        "form": {k: request.form.getlist(k) for k in request.form.keys()},
+        "json": js,
+        "raw": request.get_data(as_text=True)[:10000],  # защитимся от огромных тел
+    }
+    # Логируем в stdout (Portainer logs)
+    log.info("SPY incoming: %s", resp)
+    return jsonify(resp), 200
+
+# ===== Основной хук =====
 @bp.route("/hooks/deal-update", methods=["POST"])
 def on_deal_update():
     # защита секретом (?secret=...)
