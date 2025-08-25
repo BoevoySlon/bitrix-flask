@@ -17,15 +17,22 @@ bp = Blueprint("deal_hooks", __name__)
 BITRIX_URL = os.getenv("BITRIX_OUTGOING_URL", "").rstrip("/") + "/"
 INBOUND_SECRET = os.getenv("INBOUND_SHARED_SECRET")
 
-# Список и поля
-LIST_ID = 68
-SEARCH_PROP = "PROPERTY_204"            # ключ поиска в списке
-VALUE_PROP = "PROPERTY_202"             # берём дату из этого свойства
-TARGET_DEAL_FIELD = "UF_CRM_1755600973" # целевое поле сделки (тип: дата)
+LIST_ID = int(os.getenv("LIST_ID", "68"))
 
-# Таймауты и ретраи для REST Bitrix24
-CONNECT_TIMEOUT = float(os.getenv("BITRIX_CONNECT_TIMEOUT", "5"))   # сек handshake
-READ_TIMEOUT    = float(os.getenv("BITRIX_READ_TIMEOUT", "25"))     # сек чтение
+# Названия/коды полей (на случай, если numeric-ID в памяти ускакал)
+SEARCH_FIELD_ID_FALLBACK = "PROPERTY_204"                # ID услуги (число)
+SEARCH_FIELD_CODE_FALLBACK = "ID_uslugi"                 # код из скрина
+SEARCH_FIELD_NAME_FALLBACK = "ID услуги"                 # имя поля
+
+VALUE_FIELD_ID_FALLBACK = "PROPERTY_202"                 # дата УПД (если верно)
+VALUE_FIELD_CODE_FALLBACK = os.getenv("VALUE_FIELD_CODE", "")     # например: data_upd
+VALUE_FIELD_NAME_FALLBACK = os.getenv("VALUE_FIELD_NAME", "Дата выставления УПД")
+
+TARGET_DEAL_FIELD = os.getenv("TARGET_DEAL_FIELD", "UF_CRM_1755600973")
+
+# Таймауты и ретраи
+CONNECT_TIMEOUT = float(os.getenv("BITRIX_CONNECT_TIMEOUT", "5"))
+READ_TIMEOUT    = float(os.getenv("BITRIX_READ_TIMEOUT", "25"))
 TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
 
 SESSION = requests.Session()
@@ -43,16 +50,14 @@ SESSION.mount("http://", adapter)
 log = logging.getLogger(__name__)
 
 
-# ====== HTTP-обёртки ======
+# ====== HTTP ======
 def bx_get(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{BITRIX_URL}{method}"
-    r = SESSION.get(url, params=params, timeout=TIMEOUT)
+    r = SESSION.get(f"{BITRIX_URL}{method}", params=params, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
 
 def bx_post(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{BITRIX_URL}{method}"
-    r = SESSION.post(url, json=payload, timeout=TIMEOUT)
+    r = SESSION.post(f"{BITRIX_URL}{method}", json=payload, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
 
@@ -72,7 +77,6 @@ def update_deal_field(deal_id: int, field: str, value: Any) -> bool:
     return bool(resp.get("result") is True)
 
 def get_product_info(product_id: Any) -> Dict[str, Any]:
-    """crm.product.get: берём расширенную инфу по товару (ID, XML_ID, CODE, NAME и т.д.)"""
     try:
         data = bx_get("crm.product.get", {"id": product_id})
         return data.get("result") or {}
@@ -81,59 +85,121 @@ def get_product_info(product_id: Any) -> Dict[str, Any]:
         return {}
 
 
+# ====== Lists: метаданные полей ======
+def get_list_fields() -> List[Dict[str, Any]]:
+    data = bx_get("lists.field.get", {"IBLOCK_TYPE_ID": "lists", "IBLOCK_ID": LIST_ID})
+    return data.get("result", []) or []
+
+def resolve_field_ids() -> Tuple[List[str], List[str], Dict[str, Any]]:
+    """
+    Возвращает:
+      - список возможных ТЕГОВ свойства для поиска (['PROPERTY_204', 'PROPERTY_ID_uslugi', ...])
+      - список возможных ТЕГОВ свойства даты (['PROPERTY_202', 'PROPERTY_data_upd', ...])
+      - словарь debug с тем, что обнаружили
+    """
+    fields = get_list_fields()
+    search_tags: List[str] = []
+    value_tags: List[str]  = []
+
+    # Нормируем к верхнему регистру для сравнения
+    def norm(s: Optional[str]) -> str:
+        return (s or "").strip()
+
+    # заранее добавим фолбэки
+    if SEARCH_FIELD_ID_FALLBACK:
+        search_tags.append(SEARCH_FIELD_ID_FALLBACK)
+    if SEARCH_FIELD_CODE_FALLBACK:
+        search_tags.append(f"PROPERTY_{SEARCH_FIELD_CODE_FALLBACK}")
+
+    if VALUE_FIELD_ID_FALLBACK:
+        value_tags.append(VALUE_FIELD_ID_FALLBACK)
+    if VALUE_FIELD_CODE_FALLBACK:
+        value_tags.append(f"PROPERTY_{VALUE_FIELD_CODE_FALLBACK}")
+
+    # пробегаем поля из API и добавляем варианты
+    for f in fields:
+        field_id = norm(f.get("FIELD_ID"))          # например, 'PROPERTY_204'
+        code     = norm(f.get("CODE"))              # например, 'ID_uslugi'
+        name     = norm(f.get("NAME"))              # например, 'Дата выставления УПД'
+        t        = norm(f.get("TYPE"))
+
+        # Для поля поиска (ID услуги)
+        if field_id == SEARCH_FIELD_ID_FALLBACK or code == SEARCH_FIELD_CODE_FALLBACK or name == SEARCH_FIELD_NAME_FALLBACK:
+            if field_id and field_id not in search_tags:
+                search_tags.append(field_id)
+            if code and f"PROPERTY_{code}" not in search_tags:
+                search_tags.append(f"PROPERTY_{code}")
+
+        # Для поля даты (ищем по id/code/name и по типу даты)
+        if field_id == VALUE_FIELD_ID_FALLBACK or code == VALUE_FIELD_CODE_FALLBACK or name == VALUE_FIELD_NAME_FALLBACK or t.lower() in ("s:date", "s:datetime", "date"):
+            if field_id and field_id not in value_tags:
+                value_tags.append(field_id)
+            if code and f"PROPERTY_{code}" not in value_tags:
+                value_tags.append(f"PROPERTY_{code}")
+
+    debug = {"search_tags": search_tags, "value_tags": value_tags}
+    return search_tags, value_tags, debug
+
+
 # ====== Даты ======
 def normalize_date_yyyy_mm_dd(value: str) -> Optional[str]:
     if not value:
         return None
     s = str(value).strip()
-
     m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-
     m = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", s)
     if m:
         return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
-
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         return dt.date().isoformat()
     except Exception:
         return None
 
-def extract_value_prop(el: Dict[str, Any], prop_code: str) -> Optional[str]:
-    raw = el.get(prop_code)
-    if raw is None:
-        return None
+def extract_value_prop(el: Dict[str, Any], prop_keys: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Пробуем вытащить дату по любому ключу из prop_keys.
+    Возвращает (нормализованная_дата|None, ключ_из_которого_взяли|None)
+    """
+    for key in prop_keys:
+        if key not in el:
+            continue
+        raw = el.get(key)
+        # Значение бывает строкой / словарём / массивом словарей
+        def to_scalar(v: Any) -> Optional[str]:
+            if isinstance(v, dict):
+                v = v.get("VALUE") or v.get("value") or v.get("TEXT")
+            return str(v).strip() if v is not None else None
 
-    def to_scalar(v: Any) -> Optional[str]:
-        if isinstance(v, dict):
-            v = v.get("VALUE") or v.get("value")
-        return str(v).strip() if v is not None else None
+        if isinstance(raw, list):
+            if not raw:
+                continue
+            val = to_scalar(raw[0])
+        else:
+            val = to_scalar(raw)
 
-    if isinstance(raw, list):
-        if not raw:
-            return None
-        val = to_scalar(raw[0])
-    else:
-        val = to_scalar(raw)
-
-    return normalize_date_yyyy_mm_dd(val or "")
-
-def parse_iso_date(s: str) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
-            return datetime.fromisoformat(s)
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        return None
+        norm = normalize_date_yyyy_mm_dd(val or "")
+        if norm:
+            return norm, key
+    return None, None
 
 
-# ====== Lists: поиск элемента по PROPERTY_204 ======
-def lists_get_with_filters(payloads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    for p in payloads:
+# ====== Поиск элемента списка по нескольким тегам свойства ======
+def lists_element_get_by_prop(prop_tag: str, value: str) -> List[Dict[str, Any]]:
+    base = {"IBLOCK_TYPE_ID": "lists", "IBLOCK_ID": LIST_ID}
+
+    # POST payloads
+    attempts_post = [
+        {**base, "FILTER": {f"={prop_tag}": value}},
+        {**base, "FILTER": {prop_tag: value}},
+        {**base, "filter": {f"={prop_tag}": value}},
+        {**base, "filter": {prop_tag: value}},
+        {**base, "FILTER": {prop_tag.replace("PROPERTY_", "", 1): value}},   # иногда принимают голый CODE
+        {**base, "filter": {prop_tag.replace("PROPERTY_", "", 1): value}},
+    ]
+    for p in attempts_post:
         try:
             data = bx_post("lists.element.get", p)
             res = data.get("result") or []
@@ -141,10 +207,15 @@ def lists_get_with_filters(payloads: List[Dict[str, Any]]) -> List[Dict[str, Any
                 return res
         except requests.HTTPError:
             continue
-    return []
 
-def lists_get_query_style(params_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    for params in params_list:
+    # GET query-style
+    attempts_get = [
+        {**base, f"filter[={prop_tag}]": value},
+        {**base, f"filter[{prop_tag}]": value},
+        {**base, f"filter[{prop_tag.replace('PROPERTY_', '', 1)}]": value},
+        {**base, f"filter[={prop_tag.replace('PROPERTY_', '', 1)}]": value},
+    ]
+    for params in attempts_get:
         try:
             data = bx_get("lists.element.get", params)
             res = data.get("result") or []
@@ -152,71 +223,34 @@ def lists_get_query_style(params_list: List[Dict[str, Any]]) -> List[Dict[str, A
                 return res
         except requests.HTTPError:
             continue
+
     return []
 
-def find_list_element_by_any_key(product_id: Any, xml_id: Optional[str], code: Optional[str]) -> Tuple[Optional[Dict[str, Any]], str]:
+
+def find_list_element_by_keys(product_id: Any, search_keys: List[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
-    Пытаемся найти элемент списка №68 по очереди:
-    1) PROPERTY_204 == PRODUCT_ID
-    2) PROPERTY_204 == XML_ID (если есть)
-    3) PROPERTY_204 == CODE (если есть)
-    Возвращаем (элемент|None, чем_совпало).
+    Перебираем возможные ключи свойства (ID и CODE) для поиска.
+    Возвращаем (элемент|None, какой_ключ_сработал|None).
     """
-    pid = str(product_id).strip()
-    base = {"IBLOCK_TYPE_ID": "lists", "IBLOCK_ID": LIST_ID}
-
-    def try_value(val: str, label: str) -> Optional[Dict[str, Any]]:
-        # POST-варианты
-        attempts_post = [
-            {**base, "FILTER": {f"={SEARCH_PROP}": val}},
-            {**base, "FILTER": {SEARCH_PROP: val}},
-            {**base, "filter": {f"={SEARCH_PROP}": val}},
-            {**base, "filter": {SEARCH_PROP: val}},
-        ]
-        res = lists_get_with_filters(attempts_post)
+    val = str(product_id).strip()
+    for tag in search_keys:
+        res = lists_element_get_by_prop(tag, val)
         if res:
-            return res[0]
-
-        # GET query-style
-        attempts_get = [
-            {**base, f"filter[={SEARCH_PROP}]": val},
-            {**base, f"filter[{SEARCH_PROP}]": val},
-        ]
-        res = lists_get_query_style(attempts_get)
-        if res:
-            return res[0]
-        return None
-
-    # 1) PRODUCT_ID
-    el = try_value(pid, "PRODUCT_ID")
-    if el:
-        return el, "PRODUCT_ID"
-
-    # 2) XML_ID
-    if xml_id:
-        el = try_value(str(xml_id).strip(), "XML_ID")
-        if el:
-            return el, "XML_ID"
-
-    # 3) CODE
-    if code:
-        el = try_value(str(code).strip(), "CODE")
-        if el:
-            return el, "CODE"
-
-    return None, ""
+            return res[0], tag
+    return None, None
 
 
 # ====== HTTP-хук ======
 @bp.route("/hooks/deal-update", methods=["POST"])
 def on_deal_update():
-    # Простейшая защита секретом (?secret=...)
+    # Секрет
     secret = request.args.get("secret")
     if INBOUND_SECRET and secret != INBOUND_SECRET:
         abort(403, description="forbidden")
 
-    # Режим отладки: ?debug=1|true|yes|y
+    # Отладка
     debug_mode = (request.args.get("debug", "").lower() in ("1", "true", "yes", "y"))
+    dry_run    = (request.args.get("dry_run", "").lower() in ("1", "true", "yes", "y"))
 
     try:
         payload = request.get_json(silent=True) or {}
@@ -227,15 +261,19 @@ def on_deal_update():
         )
         if not deal_id:
             return jsonify({"status": "skip", "reason": "no deal id"}), 200
-
         deal_id = int(deal_id)
 
-        # 1) Товарные строки сделки
+        # 0) Разрешаем теги полей по метаданным
+        search_tags, value_tags, fields_dbg = resolve_field_ids()
+
+        # 1) Товары сделки
         rows = get_deal_products(deal_id)
         if not rows:
-            return jsonify({"status": "skip", "reason": "no products"}), 200
+            body = {"status": "skip", "reason": "no products"}
+            if debug_mode:
+                body["fields_dbg"] = fields_dbg
+            return jsonify(body), 200
 
-        # 2) Ищем даты по всем товарам с fallback'ами ключей
         found_dates: List[str] = []
         debug_matches: List[Dict[str, Any]] = []
 
@@ -248,35 +286,53 @@ def on_deal_update():
             xml_id = p.get("XML_ID")
             code   = p.get("CODE")
 
-            el, matched_by = find_list_element_by_any_key(product_id, xml_id, code)
+            el, matched_tag = find_list_element_by_keys(product_id, search_tags)
             if not el:
                 debug_matches.append({
-                    "product_id": product_id,
-                    "xml_id": xml_id,
-                    "code": code,
+                    "product_id": product_id, "xml_id": xml_id, "code": code,
                     "match": None
                 })
                 continue
 
-            date_value = extract_value_prop(el, VALUE_PROP)
-            debug_matches.append({
+            date_value, date_from_key = extract_value_prop(el, value_tags)
+            debug_entry = {
                 "product_id": product_id,
                 "xml_id": xml_id,
                 "code": code,
-                "match": matched_by,
-                "date": date_value
-            })
+                "match": matched_tag,
+                "date": date_value,
+                "date_from_key": date_from_key
+            }
+            # Если в debug хочется видеть заголовки свойств элемента:
+            if debug_mode:
+                # покажем только ключи свойств, чтобы не раздувать ответ
+                debug_entry["el_keys"] = [k for k in el.keys() if k.startswith("PROPERTY_") or k in ("ID","NAME")]
+
+            debug_matches.append(debug_entry)
+
             if date_value:
                 found_dates.append(date_value)
 
         if not found_dates:
-            body = {"status": "skip", "reason": "no matches in list"}
+            body = {
+                "status": "skip",
+                "reason": "date_property_missing",  # элемент есть, но даты не достали
+                "hint": "Проверьте FIELD_ID/CODE поля даты в списке №%d" % LIST_ID
+            }
             if debug_mode:
-                body["candidate_product_ids"] = [m.get("product_id") for m in debug_matches]
                 body["debug"] = debug_matches
+                body["fields_dbg"] = fields_dbg
             return jsonify(body), 200
 
-        # 3) Минимальная дата
+        # берём минимальную дату
+        def parse_iso_date(s: str) -> Optional[datetime]:
+            try:
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+                    return datetime.fromisoformat(s)
+                return datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except Exception:
+                return None
+
         parsed = [parse_iso_date(d) for d in found_dates if d]
         parsed = [p for p in parsed if p]
         if not parsed:
@@ -284,13 +340,20 @@ def on_deal_update():
 
         final_date = min(parsed).date().isoformat()
 
-        # 4) Обновляем сделку только если меняется
         current = get_deal_field(deal_id, TARGET_DEAL_FIELD)
         current_norm = normalize_date_yyyy_mm_dd(current) if current else ""
         if (current_norm or "") == final_date:
             resp = {"status": "ok", "updated": False, "note": "no change", "value": final_date}
             if debug_mode:
-                matched = [m for m in debug_matches if m.get("match")]
+                matched = [m for m in debug_matches if m.get("date")]
+                resp["matched_product_ids"] = [m["product_id"] for m in matched]
+                resp["matched_products"] = matched
+            return jsonify(resp), 200
+
+        if dry_run:
+            resp = {"status": "ok", "updated": False, "note": "dry_run", "value": final_date}
+            if debug_mode:
+                matched = [m for m in debug_matches if m.get("date")]
                 resp["matched_product_ids"] = [m["product_id"] for m in matched]
                 resp["matched_products"] = matched
             return jsonify(resp), 200
@@ -298,7 +361,7 @@ def on_deal_update():
         ok = update_deal_field(deal_id, TARGET_DEAL_FIELD, final_date)
         resp = {"status": "ok", "updated": ok, "value": final_date}
         if debug_mode:
-            matched = [m for m in debug_matches if m.get("match")]
+            matched = [m for m in debug_matches if m.get("date")]
             resp["matched_product_ids"] = [m["product_id"] for m in matched]
             resp["matched_products"] = matched
         return jsonify(resp), 200
