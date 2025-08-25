@@ -1,12 +1,9 @@
 # deal_hooks.py
 import os
 import re
-import time
 import logging
-import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-from collections import deque
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -21,19 +18,10 @@ from requests.exceptions import (
 
 bp = Blueprint("deal_hooks", __name__)
 
-# ===== ЛОГИРОВАНИЕ =====
+# ===== ЛОГИРОВАНИЕ (минимум) =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-def _get_logger() -> logging.Logger:
-    # В gunicorn пишем в gunicorn.error; локально — базовая конфигурация
-    logger = logging.getLogger("gunicorn.error")
-    if not logger.handlers:
-        logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
-        logger = logging.getLogger(__name__)
-    logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-    return logger
-
-log = _get_logger()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+log = logging.getLogger(__name__)
 
 # ===== Конфигурация =====
 BITRIX_URL = os.getenv("BITRIX_OUTGOING_URL", "").rstrip("/") + "/"
@@ -44,7 +32,7 @@ SEARCH_PROP = "PROPERTY_204"             # ищем по этому свойст
 DATE_PROP   = "PROPERTY_202"             # берём дату из этого свойства
 TARGET_DEAL_FIELD = os.getenv("TARGET_DEAL_FIELD", "UF_CRM_1755600973")
 
-# Таймауты/ретраи HTTP (перенастраиваются через ENV)
+# Таймауты/ретраи HTTP (через ENV)
 CONNECT_TIMEOUT = float(os.getenv("BITRIX_CONNECT_TIMEOUT", "8"))
 READ_TIMEOUT    = float(os.getenv("BITRIX_READ_TIMEOUT", "30"))
 TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
@@ -67,40 +55,6 @@ retry = Retry(
 adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
 SESSION.mount("https://", adapter)
 SESSION.mount("http://", adapter)
-
-# ===== Память для /hooks/spy =====
-_SPY_BUFFER_MAX = int(os.getenv("SPY_BUFFER_MAX", "50"))
-_spy_buf = deque(maxlen=_SPY_BUFFER_MAX)
-_spy_lock = threading.Lock()
-
-def _client_ip() -> str:
-    xfwd = request.headers.get("X-Forwarded-For")
-    if xfwd:
-        return xfwd.split(",")[0].strip()
-    return request.remote_addr or ""
-
-def _capture_request() -> Dict[str, Any]:
-    try:
-        js = request.get_json(silent=True)
-    except Exception:
-        js = None
-    data = request.get_data()  # bytes
-    return {
-        "ts": datetime.utcnow().isoformat() + "Z",
-        "ip": _client_ip(),
-        "method": request.method,
-        "path": request.path,
-        "query": request.args.to_dict(flat=False),
-        "headers": {k: v for k, v in request.headers.items()},
-        "form": {k: request.form.getlist(k) for k in request.form.keys()},
-        "json": js,
-        "raw_len": len(data),
-        "raw": (data[:10000].decode("utf-8", errors="replace") if data else ""),
-    }
-
-def _store_spy(evt: Dict[str, Any]) -> None:
-    with _spy_lock:
-        _spy_buf.append(evt)
 
 # ===== Низкоуровневые вызовы REST =====
 def bx_get(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -171,7 +125,7 @@ def _flatten_scalar(x: Any) -> Optional[str]:
             return _flatten_scalar(x["VALUE"])
         if "value" in x and x["value"] not in (None, ""):
             return _flatten_scalar(x["value"])
-        v = _first_entry_value(x)  # ассоциативный словарь вида {"1616": "31.08.2025"}
+        v = _first_entry_value(x)  # ассоц: {"1616": "31.08.2025"}
         return _flatten_scalar(v)
     s = str(x).strip()
     return s or None
@@ -212,17 +166,13 @@ def fetch_elements_by_product_id(product_id: Any) -> List[Dict[str, Any]]:
     data = bx_post_form("lists.element.get", data_pairs)
     return data.get("result") or []
 
-def extract_date_for_product(elements: List[Dict[str, Any]], product_id: Any, debug: bool = False) -> Tuple[Optional[str], Dict[str, Any]]:
+def extract_date_for_product(elements: List[Dict[str, Any]], product_id: Any) -> Optional[str]:
     """
     Из списка элементов (уже с PROPERTY_202/204) находим тот, где PROPERTY_204 == product_id,
     вытаскиваем дату из PROPERTY_202 и нормализуем.
     """
     pid = str(product_id).strip()
-    dbg: Dict[str, Any] = {"checked": 0, "matches": []}
-
     for el in elements:
-        dbg["checked"] += 1
-
         # значение PROPERTY_204
         raw_pid = el.get(f"{SEARCH_PROP}_VALUE", None)
         if raw_pid is None:
@@ -248,110 +198,47 @@ def extract_date_for_product(elements: List[Dict[str, Any]], product_id: Any, de
 
         date_scalar = _flatten_scalar(raw_date)
         date_norm = normalize_date_yyyy_mm_dd(date_scalar)
-
-        if debug:
-            dbg["matches"].append({
-                "element_id": el.get("ID"),
-                "name": el.get("NAME"),
-                "raw_pid": raw_pid,
-                "flat_pid": flat_pid,
-                "raw_date": raw_date,
-                "date_scalar": date_scalar,
-                "date_norm": date_norm,
-            })
-
         if date_norm:
-            return date_norm, dbg
-
-    return None, dbg
+            return date_norm
+    return None
 
 # ===== Разбор входящих вебхуков (JSON и form-urlencoded) =====
-def _extract_deal_id_from_request() -> Tuple[Optional[int], Dict[str, Any]]:
+def _extract_deal_id_from_request() -> Optional[int]:
     """
     Поддерживаем оба формата:
     - JSON: {"data":{"FIELDS":{"ID":"..."}}, ...} или {"FIELDS":{"ID":"..."}}, {"deal_id": "..."}
     - FORM: data[FIELDS][ID]=..., data[ID]=..., FIELDS[ID]=..., ID=...
     """
-    debug: Dict[str, Any] = {"source": None, "keys": []}
-
-    # 1) JSON
+    # JSON
     payload = request.get_json(silent=True) or {}
     if isinstance(payload, dict):
-        candidates = [
-            ("json.data.FIELDS.ID", lambda p: p.get("data", {}).get("FIELDS", {}).get("ID")),
-            ("json.FIELDS.ID",     lambda p: p.get("FIELDS", {}).get("ID")),
-            ("json.deal_id",       lambda p: p.get("deal_id")),
-            ("json.ID",            lambda p: p.get("ID")),
-        ]
-        for name, fn in candidates:
+        for getter in (
+            lambda p: p.get("data", {}).get("FIELDS", {}).get("ID"),
+            lambda p: p.get("FIELDS", {}).get("ID"),
+            lambda p: p.get("deal_id"),
+            lambda p: p.get("ID"),
+        ):
             try:
-                v = fn(payload)
+                v = getter(payload)
             except Exception:
                 v = None
-            debug["keys"].append((name, bool(v)))
             if v:
-                debug["source"] = "json"
                 try:
-                    return int(v), debug
+                    return int(v)
                 except Exception:
-                    return None, debug
+                    return None
 
-    # 2) FORM (application/x-www-form-urlencoded)
+    # FORM
     form = request.form or {}
     if form:
-        form_candidates = [
-            "data[FIELDS][ID]",
-            "FIELDS[ID]",
-            "data[ID]",
-            "ID",
-            "deal_id",
-        ]
-        for k in form_candidates:
-            v = form.get(k)
-            debug["keys"].append((f"form.{k}", bool(v)))
+        for key in ("data[FIELDS][ID]", "FIELDS[ID]", "data[ID]", "ID", "deal_id"):
+            v = form.get(key)
             if v:
-                debug["source"] = "form"
                 try:
-                    return int(v), debug
+                    return int(v)
                 except Exception:
-                    return None, debug
-
-    return None, debug
-
-# ===== SPY: эхо-эндпоинты для отладки исходящих вебхуков =====
-@bp.route("/hooks/spy", methods=["GET", "POST"])
-def incoming_spy():
-    secret = request.args.get("secret")
-    if INBOUND_SECRET and secret != INBOUND_SECRET:
-        abort(403, description="forbidden")
-
-    evt = _capture_request()
-    _store_spy(evt)
-    log.info("SPY incoming: %s", evt)
-    return jsonify({"status": "ok", "echo": evt}), 200
-
-@bp.route("/hooks/spy/last", methods=["GET"])
-def incoming_spy_last():
-    secret = request.args.get("secret")
-    if INBOUND_SECRET and secret != INBOUND_SECRET:
-        abort(403, description="forbidden")
-
-    try:
-        n = int(request.args.get("n", "5"))
-    except Exception:
-        n = 5
-    with _spy_lock:
-        items = list(_spy_buf)[-n:]
-    return jsonify({"status": "ok", "count": len(items), "items": items}), 200
-
-@bp.route("/hooks/spy/clear", methods=["POST"])
-def incoming_spy_clear():
-    secret = request.args.get("secret")
-    if INBOUND_SECRET and secret != INBOUND_SECRET:
-        abort(403, description="forbidden")
-    with _spy_lock:
-        _spy_buf.clear()
-    return jsonify({"status": "ok", "cleared": True}), 200
+                    return None
+    return None
 
 # ===== Основной хук =====
 @bp.route("/hooks/deal-update", methods=["POST"])
@@ -361,40 +248,27 @@ def on_deal_update():
     if INBOUND_SECRET and secret != INBOUND_SECRET:
         abort(403, description="forbidden")
 
-    debug_mode = (request.args.get("debug", "").lower() in ("1", "true", "yes", "y"))
-    dry_run    = (request.args.get("dry_run", "").lower() in ("1", "true", "yes", "y"))
-
     try:
-        deal_id, did_dbg = _extract_deal_id_from_request()
+        deal_id = _extract_deal_id_from_request()
         if not deal_id:
-            return jsonify({"status": "skip", "reason": "no deal id", "parse_dbg": did_dbg}), 200
+            return jsonify({"status": "skip", "reason": "no deal id"}), 200
 
         rows = get_deal_products(deal_id)
         if not rows:
             return jsonify({"status": "skip", "reason": "no products"}), 200
 
-        found_dates: List[str] = []
-        dbg_all: List[Dict[str, Any]] = []
-
+        dates: List[str] = []
         for row in rows:
             product_id = row.get("PRODUCT_ID")
             if not product_id:
                 continue
-
             els = fetch_elements_by_product_id(product_id)
-            date_norm, dbg = extract_date_for_product(els, product_id, debug=debug_mode)
-            if debug_mode:
-                dbg["product_id"] = product_id
-                dbg_all.append(dbg)
-            if date_norm:
-                found_dates.append(date_norm)
+            d = extract_date_for_product(els, product_id)
+            if d:
+                dates.append(d)
 
-        if not found_dates:
-            body = {"status": "skip", "reason": "date_property_missing"}
-            if debug_mode:
-                body["debug"] = dbg_all
-                body["parse_dbg"] = did_dbg
-            return jsonify(body), 200
+        if not dates:
+            return jsonify({"status": "skip", "reason": "date_property_missing"}), 200
 
         # минимальная дата
         def parse_iso(d: str) -> Optional[datetime]:
@@ -405,7 +279,7 @@ def on_deal_update():
             except Exception:
                 return None
 
-        parsed = [p for p in (parse_iso(d) for d in found_dates) if p]
+        parsed = [p for p in (parse_iso(d) for d in dates) if p]
         if not parsed:
             return jsonify({"status": "skip", "reason": "dates invalid"}), 200
         final_date = min(parsed).date().isoformat()
@@ -413,25 +287,10 @@ def on_deal_update():
         current = get_deal_field(deal_id, TARGET_DEAL_FIELD)
         current_norm = normalize_date_yyyy_mm_dd(str(current) if current else "")
         if (current_norm or "") == final_date:
-            resp = {"status": "ok", "updated": False, "note": "no change", "value": final_date}
-            if debug_mode:
-                resp["debug"] = dbg_all
-                resp["parse_dbg"] = did_dbg
-            return jsonify(resp), 200
-
-        if dry_run:
-            resp = {"status": "ok", "updated": False, "note": "dry_run", "value": final_date}
-            if debug_mode:
-                resp["debug"] = dbg_all
-                resp["parse_dbg"] = did_dbg
-            return jsonify(resp), 200
+            return jsonify({"status": "ok", "updated": False, "value": final_date}), 200
 
         ok = update_deal_field(deal_id, TARGET_DEAL_FIELD, final_date)
-        resp = {"status": "ok", "updated": ok, "value": final_date}
-        if debug_mode:
-            resp["debug"] = dbg_all
-            resp["parse_dbg"] = did_dbg
-        return jsonify(resp), 200
+        return jsonify({"status": "ok", "updated": ok, "value": final_date}), 200
 
     except (RequestsTimeout, ReadTimeout, ConnectTimeout) as e:
         # мягкая деградация при таймаутах
@@ -443,3 +302,11 @@ def on_deal_update():
     except Exception as e:
         log.exception("Unhandled")
         return jsonify({"status": "error", "detail": str(e)}), 500
+
+# ===== (/hooks/spy и прочая отладка удалены)
+# @bp.route("/hooks/spy", methods=["GET","POST"])
+# def incoming_spy(): ...
+# @bp.route("/hooks/spy/last", methods=["GET"])
+# def incoming_spy_last(): ...
+# @bp.route("/hooks/spy/clear", methods=["POST"])
+# def incoming_spy_clear(): ...
