@@ -1,9 +1,12 @@
 # deal_hooks.py
 import os
 import re
+import time
 import logging
+import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from collections import deque
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -17,6 +20,20 @@ from requests.exceptions import (
 )
 
 bp = Blueprint("deal_hooks", __name__)
+
+# ===== ЛОГИРОВАНИЕ =====
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+def _get_logger() -> logging.Logger:
+    # В gunicorn пишем в gunicorn.error; локально — базовая конфигурация
+    logger = logging.getLogger("gunicorn.error")
+    if not logger.handlers:
+        logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+        logger = logging.getLogger(__name__)
+    logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    return logger
+
+log = _get_logger()
 
 # ===== Конфигурация =====
 BITRIX_URL = os.getenv("BITRIX_OUTGOING_URL", "").rstrip("/") + "/"
@@ -51,7 +68,39 @@ adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
 SESSION.mount("https://", adapter)
 SESSION.mount("http://", adapter)
 
-log = logging.getLogger(__name__)
+# ===== Память для /hooks/spy =====
+_SPY_BUFFER_MAX = int(os.getenv("SPY_BUFFER_MAX", "50"))
+_spy_buf = deque(maxlen=_SPY_BUFFER_MAX)
+_spy_lock = threading.Lock()
+
+def _client_ip() -> str:
+    xfwd = request.headers.get("X-Forwarded-For")
+    if xfwd:
+        return xfwd.split(",")[0].strip()
+    return request.remote_addr or ""
+
+def _capture_request() -> Dict[str, Any]:
+    try:
+        js = request.get_json(silent=True)
+    except Exception:
+        js = None
+    data = request.get_data()  # bytes
+    return {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "ip": _client_ip(),
+        "method": request.method,
+        "path": request.path,
+        "query": request.args.to_dict(flat=False),
+        "headers": {k: v for k, v in request.headers.items()},
+        "form": {k: request.form.getlist(k) for k in request.form.keys()},
+        "json": js,
+        "raw_len": len(data),
+        "raw": (data[:10000].decode("utf-8", errors="replace") if data else ""),
+    }
+
+def _store_spy(evt: Dict[str, Any]) -> None:
+    with _spy_lock:
+        _spy_buf.append(evt)
 
 # ===== Низкоуровневые вызовы REST =====
 def bx_get(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -216,33 +265,40 @@ def extract_date_for_product(elements: List[Dict[str, Any]], product_id: Any, de
 
     return None, dbg
 
-# ===== SPY: эхо-эндпоинт для отладки исходящих вебхуков =====
+# ===== SPY: эхо-эндпоинты для отладки исходящих вебхуков =====
 @bp.route("/hooks/spy", methods=["GET", "POST"])
 def incoming_spy():
     secret = request.args.get("secret")
     if INBOUND_SECRET and secret != INBOUND_SECRET:
         abort(403, description="forbidden")
 
-    # Попробуем распарсить JSON, но ничего не ломаем, если это form-POST
-    js = None
-    try:
-        js = request.get_json(silent=True)
-    except Exception:
-        js = None
+    evt = _capture_request()
+    _store_spy(evt)
+    log.info("SPY incoming: %s", evt)
+    return jsonify({"status": "ok", "echo": evt}), 200
 
-    resp = {
-        "status": "ok",
-        "method": request.method,
-        "path": request.path,
-        "query": request.args.to_dict(flat=False),
-        "headers": {k: v for k, v in request.headers.items()},
-        "form": {k: request.form.getlist(k) for k in request.form.keys()},
-        "json": js,
-        "raw": request.get_data(as_text=True)[:10000],  # защитимся от огромных тел
-    }
-    # Логируем в stdout (Portainer logs)
-    log.info("SPY incoming: %s", resp)
-    return jsonify(resp), 200
+@bp.route("/hooks/spy/last", methods=["GET"])
+def incoming_spy_last():
+    secret = request.args.get("secret")
+    if INBOUND_SECRET and secret != INBOUND_SECRET:
+        abort(403, description="forbidden")
+
+    try:
+        n = int(request.args.get("n", "5"))
+    except Exception:
+        n = 5
+    with _spy_lock:
+        items = list(_spy_buf)[-n:]
+    return jsonify({"status": "ok", "count": len(items), "items": items}), 200
+
+@bp.route("/hooks/spy/clear", methods=["POST"])
+def incoming_spy_clear():
+    secret = request.args.get("secret")
+    if INBOUND_SECRET and secret != INBOUND_SECRET:
+        abort(403, description="forbidden")
+    with _spy_lock:
+        _spy_buf.clear()
+    return jsonify({"status": "ok", "cleared": True}), 200
 
 # ===== Основной хук =====
 @bp.route("/hooks/deal-update", methods=["POST"])
