@@ -19,12 +19,12 @@ INBOUND_SECRET = os.getenv("INBOUND_SHARED_SECRET")
 
 LIST_ID = int(os.getenv("LIST_ID", "68"))
 
-# Поля списка (фолбэки, если авторазбор не подскажет лучше)
+# Поля списка (фолбэки)
 SEARCH_FIELD_ID_FALLBACK = "PROPERTY_204"          # ключ поиска (ID услуги)
-SEARCH_FIELD_CODE_FALLBACK = "ID_uslugi"           # код по интерфейсу
+SEARCH_FIELD_CODE_FALLBACK = "ID_uslugi"           # код поля по интерфейсу
 SEARCH_FIELD_NAME_FALLBACK = "ID услуги"           # имя поля
 
-VALUE_FIELD_ID_FALLBACK = "PROPERTY_202"           # дата в списке
+VALUE_FIELD_ID_FALLBACK = "PROPERTY_202"           # поле даты
 VALUE_FIELD_CODE_FALLBACK = os.getenv("VALUE_FIELD_CODE", "")
 VALUE_FIELD_NAME_FALLBACK = os.getenv("VALUE_FIELD_NAME", "Дата выставления УПД")
 
@@ -50,7 +50,7 @@ SESSION.mount("http://", adapter)
 log = logging.getLogger(__name__)
 
 
-# ====== HTTP ======
+# ====== HTTP helpers ======
 def bx_get(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
     r = SESSION.get(f"{BITRIX_URL}{method}", params=params, timeout=TIMEOUT)
     r.raise_for_status()
@@ -58,6 +58,16 @@ def bx_get(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
 def bx_post(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     r = SESSION.post(f"{BITRIX_URL}{method}", json=payload, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+def bx_post_form(method: str, data: List[Tuple[str, str]]) -> Dict[str, Any]:
+    """
+    Form-POST (application/x-www-form-urlencoded) с поддержкой повторяющихся полей (select[]).
+    data — список пар (key, value), чтобы можно было добавить несколько select[].
+    """
+    url = f"{BITRIX_URL}{method}"
+    r = SESSION.post(url, data=data, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()
 
@@ -87,12 +97,7 @@ def get_product_info(product_id: Any) -> Dict[str, Any]:
 
 # ====== Lists: метаданные полей ======
 def _result_to_field_list(result_obj: Any) -> List[Dict[str, Any]]:
-    """
-    lists.field.get может вернуть:
-      - список словарей
-      - словарь вида { "PROPERTY_XXX": {...}, "PROPERTY_YYY": {...} }
-    Приводим к списку словарей.
-    """
+    """lists.field.get может вернуть list или dict; приводим к списку словарей."""
     if isinstance(result_obj, list):
         return [x for x in result_obj if isinstance(x, dict)]
     if isinstance(result_obj, dict):
@@ -106,9 +111,9 @@ def get_list_fields() -> List[Dict[str, Any]]:
 def resolve_field_ids() -> Tuple[List[str], List[str], Dict[str, Any]]:
     """
     Возвращает:
-      - варианты тегов свойства для поиска (search_tags)
-      - варианты тегов свойства даты (value_tags)
-      - debug-словарь с тем, что нашли
+      - search_tags: варианты тегов для поиска (FIELD_ID и CODE)
+      - value_tags : варианты тегов для даты (FIELD_ID/CODE/по типу)
+      - debug словарь
     """
     fields = get_list_fields()
     search_tags: List[str] = []
@@ -117,7 +122,7 @@ def resolve_field_ids() -> Tuple[List[str], List[str], Dict[str, Any]]:
     def norm(s: Optional[str]) -> str:
         return (s or "").strip()
 
-    # Базовые фолбэки
+    # Фолбэки
     if SEARCH_FIELD_ID_FALLBACK:
         search_tags.append(SEARCH_FIELD_ID_FALLBACK)
     if SEARCH_FIELD_CODE_FALLBACK:
@@ -128,21 +133,20 @@ def resolve_field_ids() -> Tuple[List[str], List[str], Dict[str, Any]]:
     if VALUE_FIELD_CODE_FALLBACK:
         value_tags.append(f"PROPERTY_{VALUE_FIELD_CODE_FALLBACK}")
 
-    # Пробегаем реальные поля
     for f in fields:
         field_id = norm(f.get("FIELD_ID"))  # 'PROPERTY_204'
         code     = norm(f.get("CODE"))      # 'ID_uslugi'
         name     = norm(f.get("NAME"))      # 'Дата выставления УПД'
         ftype    = norm(f.get("TYPE")).lower()
 
-        # Поле поиска (ID услуги)
+        # Поле поиска
         if field_id == SEARCH_FIELD_ID_FALLBACK or code == SEARCH_FIELD_CODE_FALLBACK or name == SEARCH_FIELD_NAME_FALLBACK:
             if field_id and field_id not in search_tags:
                 search_tags.append(field_id)
             if code and f"PROPERTY_{code}" not in search_tags:
                 search_tags.append(f"PROPERTY_{code}")
 
-        # Поле даты (по id/code/name/типу)
+        # Поле даты
         if (
             field_id == VALUE_FIELD_ID_FALLBACK
             or (VALUE_FIELD_CODE_FALLBACK and code == VALUE_FIELD_CODE_FALLBACK)
@@ -177,10 +181,10 @@ def normalize_date_yyyy_mm_dd(value: str) -> Optional[str]:
 
 def _to_scalar_date(value: Any) -> Optional[str]:
     """
-    Аккуратно извлекаем скаляр даты из разных оболочек Bitrix:
+    Извлекаем строковую дату из разных оболочек:
     - строка
-    - dict с VALUE/TEXT (в т.ч. VALUE -> dict с TEXT/ VALUE)
-    - dict-ассoц. вида {"1616":"31.08.2025"} (ключ = PROPERTY_VALUE_ID)
+    - dict с VALUE/TEXT (в т.ч. VALUE -> dict с TEXT/VALUE)
+    - dict вида {"1616":"31.08.2025"} (ключ = PROPERTY_VALUE_ID)
     - список/кортеж из вышеперечисленного
     """
     def drill(v: Any) -> Optional[str]:
@@ -193,23 +197,19 @@ def _to_scalar_date(value: Any) -> Optional[str]:
                     return s
             return None
         if isinstance(v, dict):
-            # 1) TEXT приоритетнее
             if "TEXT" in v and v["TEXT"]:
                 return str(v["TEXT"]).strip()
             if "text" in v and v["text"]:
                 return str(v["text"]).strip()
-            # 2) VALUE/value могут быть строкой или вложенным словарём
             if "VALUE" in v and v["VALUE"] not in (None, ""):
                 return drill(v["VALUE"])
             if "value" in v and v["value"] not in (None, ""):
                 return drill(v["value"])
-            # 3) Ассоциативный словарь {value_id: "значение"}
-            for vv in v.values():
+            for vv in v.values():  # {value_id: "значение"}
                 s = drill(vv)
                 if s:
                     return s
             return None
-        # скаляр
         s = str(v).strip()
         return s or None
 
@@ -217,8 +217,8 @@ def _to_scalar_date(value: Any) -> Optional[str]:
 
 def extract_value_prop(el: Dict[str, Any], prop_keys: List[str]) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
     """
-    Пробуем вытащить дату по любому ключу из prop_keys (и по ключу с суффиксом _VALUE).
-    Возвращаем (дата_YYYY-MM-DD|None, ключ|None, raw_map по ключам).
+    Пробуем вытащить дату по любому ключу из prop_keys и *_VALUE.
+    Возвращает (дата_YYYY-MM-DD|None, ключ|None, raw_seen-словарь).
     """
     raw_seen: Dict[str, Any] = {}
     for base_key in prop_keys:
@@ -236,22 +236,23 @@ def extract_value_prop(el: Dict[str, Any], prop_keys: List[str]) -> Tuple[Option
     return None, None, raw_seen
 
 
-# ====== lists.element.get с гарантированным select ======
+# ====== lists.element.get ======
 def lists_element_get_by_prop(prop_tag: str, value: str) -> List[Dict[str, Any]]:
+    """
+    Ищем элементы по свойству prop_tag == value.
+    Сначала POST c JSON (быстрый), затем GET fallback (редко нужен).
+    Возвращаем как есть (иногда тут бывают только ID/NAME).
+    """
     base = {"IBLOCK_TYPE_ID": "lists", "IBLOCK_ID": LIST_ID}
-    select_all = ["ID", "NAME", "*", "PROPERTY_*"]
-
-    # POST payloads (предпочтительно)
-    attempts_post = [
-        {**base, "FILTER": {f"={prop_tag}": value}, "select": select_all},
-        {**base, "FILTER": {prop_tag: value},       "select": select_all},
-        {**base, "filter": {f"={prop_tag}": value}, "select": select_all},
-        {**base, "filter": {prop_tag: value},       "select": select_all},
-        # на всякий случай фильтрация по голому CODE
-        {**base, "FILTER": {prop_tag.replace("PROPERTY_", "", 1): value}, "select": select_all},
-        {**base, "filter": {prop_tag.replace("PROPERTY_", "", 1): value}, "select": select_all},
+    payloads = [
+        {**base, "FILTER": {f"={prop_tag}": value}},
+        {**base, "FILTER": {prop_tag: value}},
+        {**base, "filter": {f"={prop_tag}": value}},
+        {**base, "filter": {prop_tag: value}},
+        {**base, "FILTER": {prop_tag.replace("PROPERTY_", "", 1): value}},
+        {**base, "filter": {prop_tag.replace("PROPERTY_", "", 1): value}},
     ]
-    for p in attempts_post:
+    for p in payloads:
         try:
             data = bx_post("lists.element.get", p)
             res = data.get("result") or []
@@ -260,7 +261,7 @@ def lists_element_get_by_prop(prop_tag: str, value: str) -> List[Dict[str, Any]]
         except requests.HTTPError:
             continue
 
-    # GET fallback с ручной сборкой select[] (иногда ведёт себя нестабильно — используем в крайнем случае)
+    # GET fallback (select[] не добавляем здесь — всё равно потом доберём по ELEMENT_ID)
     try:
         from urllib.parse import urlencode
         attempts_get = [
@@ -270,8 +271,7 @@ def lists_element_get_by_prop(prop_tag: str, value: str) -> List[Dict[str, Any]]
             {**base, f"filter[={prop_tag.replace('PROPERTY_', '', 1)}]": value},
         ]
         for params in attempts_get:
-            pairs = list(params.items()) + [("select[]", s) for s in select_all]
-            url = f"{BITRIX_URL}lists.element.get?{urlencode(pairs)}"
+            url = f"{BITRIX_URL}lists.element.get?{urlencode(list(params.items()))}"
             r = SESSION.get(url, timeout=TIMEOUT)
             r.raise_for_status()
             data = r.json()
@@ -283,12 +283,43 @@ def lists_element_get_by_prop(prop_tag: str, value: str) -> List[Dict[str, Any]]
 
     return []
 
+
+def lists_element_get_full_by_id(element_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Гарантированно тянем ПРОПЕРТИ через form-POST и select[].
+    """
+    data_pairs: List[Tuple[str, str]] = [
+        ("IBLOCK_TYPE_ID", "lists"),
+        ("IBLOCK_ID", str(LIST_ID)),
+        ("ELEMENT_ID", str(element_id)),
+        ("select[]", "ID"),
+        ("select[]", "NAME"),
+        ("select[]", "*"),
+        ("select[]", "PROPERTY_*"),
+    ]
+    try:
+        data = bx_post_form("lists.element.get", data_pairs)
+        res = data.get("result") or []
+        return res[0] if res else None
+    except requests.HTTPError:
+        return None
+
+
 def find_list_element_by_keys(product_id: Any, search_keys: List[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Возвращаем ПОЛНЫЙ элемент (с properties). Сначала ищем, потом добираем по ELEMENT_ID.
+    """
     val = str(product_id).strip()
     for tag in search_keys:
         res = lists_element_get_by_prop(tag, val)
-        if res:
-            return res[0], tag
+        if not res:
+            continue
+        el_brief = res[0]
+        el_id = el_brief.get("ID")
+        if not el_id:
+            return el_brief, tag  # fallback, но без свойств
+        el_full = lists_element_get_full_by_id(el_id)
+        return (el_full or el_brief), tag
     return None, None
 
 
@@ -315,7 +346,7 @@ def on_deal_update():
             return jsonify({"status": "skip", "reason": "no deal id"}), 200
         deal_id = int(deal_id)
 
-        # 0) Получаем теги полей
+        # 0) Теги полей
         search_tags, value_tags, fields_dbg = resolve_field_ids()
 
         # 1) Товары сделки
@@ -346,7 +377,9 @@ def on_deal_update():
                 })
                 continue
 
-            # берём дату по любому из известных ключей (и *_VALUE)
+            # если вдруг снова пришли только ID/NAME — покажем это в debug
+            el_keys = list(el.keys())
+
             date_value, date_from_key, raw_seen = extract_value_prop(el, value_tags)
 
             debug_entry = {
@@ -358,10 +391,8 @@ def on_deal_update():
                 "date_from_key": date_from_key,
             }
             if debug_mode:
-                # сырые содержимое ключей даты, которые пробовали
+                debug_entry["el_keys"] = el_keys
                 debug_entry["raw_date_props"] = {k: raw_seen.get(k) for k in raw_seen}
-                # список ключей элемента для наглядности
-                debug_entry["el_keys"] = [k for k in el.keys() if k.startswith("PROPERTY_") or k in ("ID", "NAME")]
 
             debug_matches.append(debug_entry)
 
