@@ -9,7 +9,12 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from flask import Blueprint, request, jsonify, abort
-from requests.exceptions import Timeout as RequestsTimeout, RequestException
+from requests.exceptions import (
+    Timeout as RequestsTimeout,
+    ReadTimeout,
+    ConnectTimeout,
+    RequestException,
+)
 
 bp = Blueprint("deal_hooks", __name__)
 
@@ -22,15 +27,22 @@ SEARCH_PROP = "PROPERTY_204"             # ищем по этому свойст
 DATE_PROP   = "PROPERTY_202"             # берём дату из этого свойства
 TARGET_DEAL_FIELD = os.getenv("TARGET_DEAL_FIELD", "UF_CRM_1755600973")
 
-# Таймауты/ретраи HTTP
-CONNECT_TIMEOUT = float(os.getenv("BITRIX_CONNECT_TIMEOUT", "5"))
-READ_TIMEOUT    = float(os.getenv("BITRIX_READ_TIMEOUT", "25"))
+# Таймауты/ретраи HTTP (перенастраиваются через ENV)
+CONNECT_TIMEOUT = float(os.getenv("BITRIX_CONNECT_TIMEOUT", "8"))
+READ_TIMEOUT    = float(os.getenv("BITRIX_READ_TIMEOUT", "30"))
 TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
+
+RETRY_TOTAL   = int(os.getenv("BITRIX_RETRY_TOTAL", "6"))
+RETRY_CONNECT = int(os.getenv("BITRIX_RETRY_CONNECT", str(RETRY_TOTAL)))
+RETRY_READ    = int(os.getenv("BITRIX_RETRY_READ", str(RETRY_TOTAL)))
+BACKOFF       = float(os.getenv("BITRIX_BACKOFF", "0.8"))
 
 SESSION = requests.Session()
 retry = Retry(
-    total=4, connect=4, read=4,
-    backoff_factor=0.6,
+    total=RETRY_TOTAL,
+    connect=RETRY_CONNECT,
+    read=RETRY_READ,
+    backoff_factor=BACKOFF,
     status_forcelist=(429, 500, 502, 503, 504),
     allowed_methods=frozenset({"GET", "POST"}),
     raise_on_status=False,
@@ -76,10 +88,6 @@ def update_deal_field(deal_id: int, field: str, value: Any) -> bool:
 
 # ===== Вспомогательные функции для списков =====
 def _first_entry_value(obj: Any) -> Optional[Any]:
-    """
-    Если obj = {"1616":"31.08.2025"} -> вернём "31.08.2025"
-    Если obj = [{"VALUE": "..."}, ...] -> вернём первый непустой
-    """
     if obj is None:
         return None
     if isinstance(obj, dict):
@@ -87,7 +95,7 @@ def _first_entry_value(obj: Any) -> Optional[Any]:
             return v
     if isinstance(obj, (list, tuple)) and obj:
         return obj[0]
-    return obj  # строка/число и т.п.
+    return obj
 
 def _flatten_scalar(x: Any) -> Optional[str]:
     """
@@ -106,20 +114,16 @@ def _flatten_scalar(x: Any) -> Optional[str]:
                 return s
         return None
     if isinstance(x, dict):
-        # приоритет TEXT
         if "TEXT" in x and x["TEXT"]:
             return str(x["TEXT"]).strip()
         if "text" in x and x["text"]:
             return str(x["text"]).strip()
-        # VALUE может быть ещё одним dict/массивом
         if "VALUE" in x and x["VALUE"] not in (None, ""):
             return _flatten_scalar(x["VALUE"])
         if "value" in x and x["value"] not in (None, ""):
             return _flatten_scalar(x["value"])
-        # ассоц. словарь вида {"1616": "31.08.2025"}
-        v = _first_entry_value(x)
+        v = _first_entry_value(x)  # ассоциативный словарь вида {"1616": "31.08.2025"}
         return _flatten_scalar(v)
-    # скаляр
     s = str(x).strip()
     return s or None
 
@@ -127,15 +131,12 @@ def normalize_date_yyyy_mm_dd(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
     s = s.strip()
-    # DD.MM.YYYY -> YYYY-MM-DD
     m = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", s)
     if m:
         return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
-    # YYYY-MM-DD... (ISO)
     m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    # ISO c временем/час.поясом
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         return dt.date().isoformat()
@@ -173,7 +174,7 @@ def extract_date_for_product(elements: List[Dict[str, Any]], product_id: Any, de
     for el in elements:
         dbg["checked"] += 1
 
-        # вытащим значение PROPERTY_204 (любой формат)
+        # значение PROPERTY_204
         raw_pid = el.get(f"{SEARCH_PROP}_VALUE", None)
         if raw_pid is None:
             raw_pid = el.get(SEARCH_PROP, None)
@@ -182,15 +183,14 @@ def extract_date_for_product(elements: List[Dict[str, Any]], product_id: Any, de
 
         flat_pid = _flatten_scalar(raw_pid)
         if flat_pid != pid:
-            # иногда Б24 присылает только {SEARCH_PROP:{valueId:pid}} — проверим и его напрямую
             if isinstance(el.get(SEARCH_PROP), dict):
                 alt = _first_entry_value(el.get(SEARCH_PROP))
                 if _flatten_scalar(alt) != pid:
                     continue
             else:
-                continue  # не совпало
+                continue
 
-        # подходящий элемент найден — вытаскиваем дату
+        # значение PROPERTY_202
         raw_date = el.get(f"{DATE_PROP}_VALUE", None)
         if raw_date is None:
             raw_date = el.get(DATE_PROP, None)
@@ -219,7 +219,7 @@ def extract_date_for_product(elements: List[Dict[str, Any]], product_id: Any, de
 # ===== HTTP-хук =====
 @bp.route("/hooks/deal-update", methods=["POST"])
 def on_deal_update():
-    # Простейшая защита секретом (?secret=...)
+    # защита секретом (?secret=...)
     secret = request.args.get("secret")
     if INBOUND_SECRET and secret != INBOUND_SECRET:
         abort(403, description="forbidden")
@@ -250,13 +250,11 @@ def on_deal_update():
             if not product_id:
                 continue
 
-            # тянем элементы по PRODUCT_ID (формой, как в рабочем curl)
             els = fetch_elements_by_product_id(product_id)
             date_norm, dbg = extract_date_for_product(els, product_id, debug=debug_mode)
             if debug_mode:
                 dbg["product_id"] = product_id
                 dbg_all.append(dbg)
-
             if date_norm:
                 found_dates.append(date_norm)
 
@@ -266,7 +264,7 @@ def on_deal_update():
                 body["debug"] = dbg_all
             return jsonify(body), 200
 
-        # берём минимальную дату
+        # минимальная дата
         def parse_iso(d: str) -> Optional[datetime]:
             try:
                 if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
@@ -300,7 +298,8 @@ def on_deal_update():
             resp["debug"] = dbg_all
         return jsonify(resp), 200
 
-    except RequestsTimeout as e:
+    except (RequestsTimeout, ReadTimeout, ConnectTimeout) as e:
+        # мягкая деградация при таймаутах
         log.warning("Bitrix REST timeout: %s", e)
         return jsonify({"status": "retry_later", "reason": "bitrix timeout"}), 200
     except RequestException as e:
