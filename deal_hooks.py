@@ -265,6 +265,59 @@ def extract_date_for_product(elements: List[Dict[str, Any]], product_id: Any, de
 
     return None, dbg
 
+# ===== Разбор входящих вебхуков (JSON и form-urlencoded) =====
+def _extract_deal_id_from_request() -> Tuple[Optional[int], Dict[str, Any]]:
+    """
+    Поддерживаем оба формата:
+    - JSON: {"data":{"FIELDS":{"ID":"..."}}, ...} или {"FIELDS":{"ID":"..."}}, {"deal_id": "..."}
+    - FORM: data[FIELDS][ID]=..., data[ID]=..., FIELDS[ID]=..., ID=...
+    """
+    debug: Dict[str, Any] = {"source": None, "keys": []}
+
+    # 1) JSON
+    payload = request.get_json(silent=True) or {}
+    if isinstance(payload, dict):
+        candidates = [
+            ("json.data.FIELDS.ID", lambda p: p.get("data", {}).get("FIELDS", {}).get("ID")),
+            ("json.FIELDS.ID",     lambda p: p.get("FIELDS", {}).get("ID")),
+            ("json.deal_id",       lambda p: p.get("deal_id")),
+            ("json.ID",            lambda p: p.get("ID")),
+        ]
+        for name, fn in candidates:
+            try:
+                v = fn(payload)
+            except Exception:
+                v = None
+            debug["keys"].append((name, bool(v)))
+            if v:
+                debug["source"] = "json"
+                try:
+                    return int(v), debug
+                except Exception:
+                    return None, debug
+
+    # 2) FORM (application/x-www-form-urlencoded)
+    form = request.form or {}
+    if form:
+        form_candidates = [
+            "data[FIELDS][ID]",
+            "FIELDS[ID]",
+            "data[ID]",
+            "ID",
+            "deal_id",
+        ]
+        for k in form_candidates:
+            v = form.get(k)
+            debug["keys"].append((f"form.{k}", bool(v)))
+            if v:
+                debug["source"] = "form"
+                try:
+                    return int(v), debug
+                except Exception:
+                    return None, debug
+
+    return None, debug
+
 # ===== SPY: эхо-эндпоинты для отладки исходящих вебхуков =====
 @bp.route("/hooks/spy", methods=["GET", "POST"])
 def incoming_spy():
@@ -312,15 +365,9 @@ def on_deal_update():
     dry_run    = (request.args.get("dry_run", "").lower() in ("1", "true", "yes", "y"))
 
     try:
-        payload = request.get_json(silent=True) or {}
-        deal_id = (
-            payload.get("data", {}).get("FIELDS", {}).get("ID")
-            or payload.get("FIELDS", {}).get("ID")
-            or payload.get("deal_id")
-        )
+        deal_id, did_dbg = _extract_deal_id_from_request()
         if not deal_id:
-            return jsonify({"status": "skip", "reason": "no deal id"}), 200
-        deal_id = int(deal_id)
+            return jsonify({"status": "skip", "reason": "no deal id", "parse_dbg": did_dbg}), 200
 
         rows = get_deal_products(deal_id)
         if not rows:
@@ -346,6 +393,7 @@ def on_deal_update():
             body = {"status": "skip", "reason": "date_property_missing"}
             if debug_mode:
                 body["debug"] = dbg_all
+                body["parse_dbg"] = did_dbg
             return jsonify(body), 200
 
         # минимальная дата
@@ -368,18 +416,21 @@ def on_deal_update():
             resp = {"status": "ok", "updated": False, "note": "no change", "value": final_date}
             if debug_mode:
                 resp["debug"] = dbg_all
+                resp["parse_dbg"] = did_dbg
             return jsonify(resp), 200
 
         if dry_run:
             resp = {"status": "ok", "updated": False, "note": "dry_run", "value": final_date}
             if debug_mode:
                 resp["debug"] = dbg_all
+                resp["parse_dbg"] = did_dbg
             return jsonify(resp), 200
 
         ok = update_deal_field(deal_id, TARGET_DEAL_FIELD, final_date)
         resp = {"status": "ok", "updated": ok, "value": final_date}
         if debug_mode:
             resp["debug"] = dbg_all
+            resp["parse_dbg"] = did_dbg
         return jsonify(resp), 200
 
     except (RequestsTimeout, ReadTimeout, ConnectTimeout) as e:
