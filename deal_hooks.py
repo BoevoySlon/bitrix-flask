@@ -19,16 +19,16 @@ INBOUND_SECRET = os.getenv("INBOUND_SHARED_SECRET")
 
 LIST_ID = int(os.getenv("LIST_ID", "68"))
 
-# Поля списка (фолбэки)
-SEARCH_FIELD_ID_FALLBACK = "PROPERTY_204"         # ID услуги (число)
-SEARCH_FIELD_CODE_FALLBACK = "ID_uslugi"          # код по скрину
-SEARCH_FIELD_NAME_FALLBACK = "ID услуги"          # имя поля
+# Поля списка (фолбэки, если авторазбор не подскажет лучше)
+SEARCH_FIELD_ID_FALLBACK = "PROPERTY_204"          # ключ поиска (ID услуги)
+SEARCH_FIELD_CODE_FALLBACK = "ID_uslugi"           # код по интерфейсу
+SEARCH_FIELD_NAME_FALLBACK = "ID услуги"           # имя поля
 
-VALUE_FIELD_ID_FALLBACK = "PROPERTY_202"          # дата (если верно)
+VALUE_FIELD_ID_FALLBACK = "PROPERTY_202"           # дата в списке
 VALUE_FIELD_CODE_FALLBACK = os.getenv("VALUE_FIELD_CODE", "")
 VALUE_FIELD_NAME_FALLBACK = os.getenv("VALUE_FIELD_NAME", "Дата выставления УПД")
 
-TARGET_DEAL_FIELD = os.getenv("TARGET_DEAL_FIELD", "UF_CRM_1755600973")
+TARGET_DEAL_FIELD = os.getenv("TARGET_DEAL_FIELD", "UF_CRM_1755600973")  # поле сделки (дата)
 
 # Таймауты/ретраи
 CONNECT_TIMEOUT = float(os.getenv("BITRIX_CONNECT_TIMEOUT", "5"))
@@ -175,46 +175,81 @@ def normalize_date_yyyy_mm_dd(value: str) -> Optional[str]:
     except Exception:
         return None
 
-def extract_value_prop(el: Dict[str, Any], prop_keys: List[str]) -> Tuple[Optional[str], Optional[str]]:
+def _to_scalar_date(value: Any) -> Optional[str]:
     """
-    Пробуем вытащить дату по любому ключу из prop_keys.
-    Возвращает (дата_YYYY-MM-DD|None, ключ|None).
+    Аккуратно извлекаем скаляр даты из разных оболочек Bitrix:
+    - строка
+    - dict с VALUE/TEXT (в т.ч. VALUE -> dict с TEXT/ VALUE)
+    - dict-ассoц. вида {"1616":"31.08.2025"} (ключ = PROPERTY_VALUE_ID)
+    - список/кортеж из вышеперечисленного
     """
-    for key in prop_keys:
-        if key not in el:
-            continue
-        raw = el.get(key)
+    def drill(v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if isinstance(v, (list, tuple)):
+            for item in v:
+                s = drill(item)
+                if s:
+                    return s
+            return None
+        if isinstance(v, dict):
+            # 1) TEXT приоритетнее
+            if "TEXT" in v and v["TEXT"]:
+                return str(v["TEXT"]).strip()
+            if "text" in v and v["text"]:
+                return str(v["text"]).strip()
+            # 2) VALUE/value могут быть строкой или вложенным словарём
+            if "VALUE" in v and v["VALUE"] not in (None, ""):
+                return drill(v["VALUE"])
+            if "value" in v and v["value"] not in (None, ""):
+                return drill(v["value"])
+            # 3) Ассоциативный словарь {value_id: "значение"}
+            for vv in v.values():
+                s = drill(vv)
+                if s:
+                    return s
+            return None
+        # скаляр
+        s = str(v).strip()
+        return s or None
 
-        def to_scalar(v: Any) -> Optional[str]:
-            if isinstance(v, dict):
-                v = v.get("VALUE") or v.get("value") or v.get("TEXT")
-            return str(v).strip() if v is not None else None
+    return drill(value)
 
-        if isinstance(raw, list):
-            if not raw:
+def extract_value_prop(el: Dict[str, Any], prop_keys: List[str]) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
+    """
+    Пробуем вытащить дату по любому ключу из prop_keys (и по ключу с суффиксом _VALUE).
+    Возвращаем (дата_YYYY-MM-DD|None, ключ|None, raw_map по ключам).
+    """
+    raw_seen: Dict[str, Any] = {}
+    for base_key in prop_keys:
+        for key in (base_key, f"{base_key}_VALUE"):
+            if key not in el:
                 continue
-            val = to_scalar(raw[0])
-        else:
-            val = to_scalar(raw)
+            raw = el.get(key)
+            raw_seen[key] = raw
+            scalar = _to_scalar_date(raw)
+            if not scalar:
+                continue
+            norm = normalize_date_yyyy_mm_dd(scalar)
+            if norm:
+                return norm, key, raw_seen
+    return None, None, raw_seen
 
-        norm = normalize_date_yyyy_mm_dd(val or "")
-        if norm:
-            return norm, key
-    return None, None
 
-
-# ====== Поиск элемента списка по свойству ======
+# ====== lists.element.get с гарантированным select ======
 def lists_element_get_by_prop(prop_tag: str, value: str) -> List[Dict[str, Any]]:
     base = {"IBLOCK_TYPE_ID": "lists", "IBLOCK_ID": LIST_ID}
+    select_all = ["ID", "NAME", "*", "PROPERTY_*"]
 
-    # POST payloads
+    # POST payloads (предпочтительно)
     attempts_post = [
-        {**base, "FILTER": {f"={prop_tag}": value}},
-        {**base, "FILTER": {prop_tag: value}},
-        {**base, "filter": {f"={prop_tag}": value}},
-        {**base, "filter": {prop_tag: value}},
-        {**base, "FILTER": {prop_tag.replace("PROPERTY_", "", 1): value}},
-        {**base, "filter": {prop_tag.replace("PROPERTY_", "", 1): value}},
+        {**base, "FILTER": {f"={prop_tag}": value}, "select": select_all},
+        {**base, "FILTER": {prop_tag: value},       "select": select_all},
+        {**base, "filter": {f"={prop_tag}": value}, "select": select_all},
+        {**base, "filter": {prop_tag: value},       "select": select_all},
+        # на всякий случай фильтрация по голому CODE
+        {**base, "FILTER": {prop_tag.replace("PROPERTY_", "", 1): value}, "select": select_all},
+        {**base, "filter": {prop_tag.replace("PROPERTY_", "", 1): value}, "select": select_all},
     ]
     for p in attempts_post:
         try:
@@ -225,21 +260,26 @@ def lists_element_get_by_prop(prop_tag: str, value: str) -> List[Dict[str, Any]]
         except requests.HTTPError:
             continue
 
-    # GET query-style
-    attempts_get = [
-        {**base, f"filter[={prop_tag}]": value},
-        {**base, f"filter[{prop_tag}]": value},
-        {**base, f"filter[{prop_tag.replace('PROPERTY_', '', 1)}]": value},
-        {**base, f"filter[={prop_tag.replace('PROPERTY_', '', 1)}]": value},
-    ]
-    for params in attempts_get:
-        try:
-            data = bx_get("lists.element.get", params)
+    # GET fallback с ручной сборкой select[] (иногда ведёт себя нестабильно — используем в крайнем случае)
+    try:
+        from urllib.parse import urlencode
+        attempts_get = [
+            {**base, f"filter[={prop_tag}]": value},
+            {**base, f"filter[{prop_tag}]": value},
+            {**base, f"filter[{prop_tag.replace('PROPERTY_', '', 1)}]": value},
+            {**base, f"filter[={prop_tag.replace('PROPERTY_', '', 1)}]": value},
+        ]
+        for params in attempts_get:
+            pairs = list(params.items()) + [("select[]", s) for s in select_all]
+            url = f"{BITRIX_URL}lists.element.get?{urlencode(pairs)}"
+            r = SESSION.get(url, timeout=TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
             res = data.get("result") or []
             if res:
                 return res
-        except requests.HTTPError:
-            continue
+    except requests.HTTPError:
+        pass
 
     return []
 
@@ -260,7 +300,7 @@ def on_deal_update():
     if INBOUND_SECRET and secret != INBOUND_SECRET:
         abort(403, description="forbidden")
 
-    # Отладка
+    # Отладка/«сухой прогон»
     debug_mode = (request.args.get("debug", "").lower() in ("1", "true", "yes", "y"))
     dry_run    = (request.args.get("dry_run", "").lower() in ("1", "true", "yes", "y"))
 
@@ -306,16 +346,21 @@ def on_deal_update():
                 })
                 continue
 
-            date_value, date_from_key = extract_value_prop(el, value_tags)
+            # берём дату по любому из известных ключей (и *_VALUE)
+            date_value, date_from_key, raw_seen = extract_value_prop(el, value_tags)
+
             debug_entry = {
                 "product_id": product_id,
                 "xml_id": xml_id,
                 "code": code,
                 "match": matched_tag,
                 "date": date_value,
-                "date_from_key": date_from_key
+                "date_from_key": date_from_key,
             }
             if debug_mode:
+                # сырые содержимое ключей даты, которые пробовали
+                debug_entry["raw_date_props"] = {k: raw_seen.get(k) for k in raw_seen}
+                # список ключей элемента для наглядности
                 debug_entry["el_keys"] = [k for k in el.keys() if k.startswith("PROPERTY_") or k in ("ID", "NAME")]
 
             debug_matches.append(debug_entry)
