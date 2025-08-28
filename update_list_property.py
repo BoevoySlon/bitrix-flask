@@ -51,9 +51,12 @@ def _normalize_prop_code(raw: Optional[str], fallback: str = "PROPERTY_202") -> 
     s = (raw or fallback).strip()
     if s.isdigit():
         return f"PROPERTY_{s}"
-    if not s.upper().startswith("PROPERTY_"):
+    up = s.upper()
+    if up == "NAME":
+        return "NAME"
+    if not up.startswith("PROPERTY_"):
         return "PROPERTY_" + s.strip("_").upper()
-    return s.upper()
+    return up
 
 DATE_PROP = _normalize_prop_code(os.getenv("BITRIX_PROPERTY_CODE", os.getenv("DATE_PROP", "PROPERTY_202")))
 
@@ -173,6 +176,17 @@ def _value_from_element(el: Dict[str, Any], code: str) -> Optional[Any]:
     return raw
 
 # ========= Получение обязательных полей и текущих значений =========
+def _normalize_field_code_from_fields_list(code_raw: Any) -> str:
+    s = str(code_raw).strip()
+    if s.upper() == "NAME":
+        return "NAME"
+    if s.isdigit():
+        return f"PROPERTY_{s}"
+    su = s.upper()
+    if su.startswith("PROPERTY_"):
+        return su
+    return s  # вдруг Bitrix вернёт уже пригодный код
+
 def get_required_field_codes() -> List[Dict[str, Any]]:
     """Возвращает [{"ID": "PROPERTY_XXX", "MULTIPLE": "Y|N", "NAME": "..."}] для IS_REQUIRED=Y (кроме NAME)."""
     pairs = [("IBLOCK_TYPE_ID", "lists"), ("IBLOCK_ID", str(LIST_ID))]
@@ -182,7 +196,8 @@ def get_required_field_codes() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for f in fields:
         try:
-            code = f.get("ID") or f.get("FIELD_ID")
+            raw_code = f.get("ID") or f.get("FIELD_ID")
+            code = _normalize_field_code_from_fields_list(raw_code)
             if not code or code == "NAME":
                 continue
             if str(f.get("IS_REQUIRED", "")).upper() == "Y":
@@ -201,7 +216,7 @@ def find_field_code_by_name(name_exact: str) -> Optional[str]:
     js = bx_post_form("lists.field.get", pairs)
     fields = _extract_fields_list(js)
     for f in fields:
-        code = f.get("ID") or f.get("FIELD_ID")
+        code = _normalize_field_code_from_fields_list(f.get("ID") or f.get("FIELD_ID"))
         if code and str(f.get("NAME", "")).strip().lower() == name_exact.strip().lower():
             return code
     return None
@@ -211,7 +226,7 @@ def get_element_subset(eid: int, req_fields: List[Dict[str, Any]]) -> Dict[str, 
     pairs: List[Tuple[str, str]] = [
         ("IBLOCK_TYPE_ID", "lists"),
         ("IBLOCK_ID", str(LIST_ID)),
-        ("filter[ID]", str(eid)),  # на практике стабильнее, чем filter[=ID]
+        ("filter[ID]", str(eid)),
         ("select[]", "ID"),
         ("select[]", "NAME"),
     ]
@@ -264,6 +279,9 @@ def update_element_with_snapshot(eid: int, date_ddmmyyyy: str, snapshot: Dict[st
     ]
     for k, v in snapshot.items():
         if k == "NAME":
+            continue
+        # ВАЖНО: не добавлять старое значение поля даты, чтобы не перезатереть новую дату
+        if k.upper() == DATE_PROP.upper():
             continue
         pairs.extend(_pairs_for_field(k, v))
     js = bx_post_form("lists.element.update", pairs)
