@@ -104,11 +104,11 @@ def last_day_of_current_month_moscow_ddmmyyyy() -> str:
     t = _today_moscow()
     last = calendar.monthrange(t.year, t.month)[1]
     d = date(t.year, t.month, last)
-    # dd.mm.YYYY
-    return f"{d.day:02d}.{d.month:02d}.{d.year:04d}"
+    return f"{d.day:02d}.{d.month:02d}.{d.year:04d}"  # dd.mm.YYYY
 
 # ========= REST helpers (form-data) =========
-def bx_post_form(method: str, data_pairs: List[Tuple[str, str]]) -> Dict[str, Any]:
+def bx_post_form(method: str, data_pairs: List[Tuple[str, str]]) -> Any:
+    """Возвращает JSON, как отдаёт Bitrix (dict/list/true/...). Подробно ругается при HTTP/не-JSON."""
     url = f"{BITRIX_URL}{method}.json"
     r = SESSION.post(url, data=data_pairs, timeout=TIMEOUT)
     if r.status_code >= 400:
@@ -125,38 +125,65 @@ def bx_post_form(method: str, data_pairs: List[Tuple[str, str]]) -> Dict[str, An
         raise RuntimeError(f"Bitrix error at {method}: {js.get('error_description') or js.get('error')}")
     return js
 
-# ========= Получение обязательных полей и текущих значений =========
-def get_required_field_codes() -> List[Dict[str, Any]]:
-    """Возвращает объекты полей с IS_REQUIRED=Y (кроме NAME)."""
-    pairs = [("IBLOCK_TYPE_ID", "lists"), ("IBLOCK_ID", str(LIST_ID))]
-    js = bx_post_form("lists.field.get", pairs)
-    out: List[Dict[str, Any]] = []
-    for f in (js.get("result") or []):
-        if f.get("IS_REQUIRED") == "Y":
-            code = f.get("ID")
-            if code and code != "NAME":
-                out.append({"ID": code, "MULTIPLE": f.get("MULTIPLE", "N")})
-    return out
+# ========= Утилиты разбора ответов =========
+def _extract_fields_list(js: Any) -> List[Dict[str, Any]]:
+    """Поддерживает разные форматы lists.field.get."""
+    if isinstance(js, dict):
+        res = js.get("result")
+        if isinstance(res, list):
+            return res
+        if isinstance(res, dict) and isinstance(res.get("fields"), list):
+            return res["fields"]
+        if isinstance(js.get("fields"), list):
+            return js["fields"]
+    if isinstance(js, list):
+        return js
+    raise RuntimeError(f"Неожиданный ответ lists.field.get: {type(js).__name__} {str(js)[:140]}")
 
 def _value_from_element(el: Dict[str, Any], code: str) -> Optional[Any]:
-    """Достаёт значение поля из ответа lists.element.get: либо *_VALUE, либо dict{'VALUE':..}, либо словарь {id: value}."""
+    """Достаёт значение поля из ответа lists.element.get: *_VALUE, dict{'VALUE':..} или {id: value} -> list."""
     v = el.get(f"{code}_VALUE")
     if v is not None:
         return v
     raw = el.get(code)
     if isinstance(raw, dict):
-        # варианты: {'VALUE': '...'} или {'123': '...','124':'...'}
         if "VALUE" in raw:
             return raw["VALUE"]
         if raw:
-            # множество значений – вернём список по порядку ключей
+            # словарь значений -> список по возрастанию ключей, если получится
             try:
-                # сохранить порядок по ключам-числам
                 items = sorted(((int(k), val) for k, val in raw.items()), key=lambda x: x[0])
                 return [val for _, val in items]
             except Exception:
                 return list(raw.values())
     return raw
+
+# ========= Получение обязательных полей и текущих значений =========
+def get_required_field_codes() -> List[Dict[str, Any]]:
+    """Возвращает [{"ID": "PROPERTY_XXX", "MULTIPLE": "Y|N", "NAME": "..."}] для IS_REQUIRED=Y (кроме NAME)."""
+    pairs = [("IBLOCK_TYPE_ID", "lists"), ("IBLOCK_ID", str(LIST_ID))]
+    js = bx_post_form("lists.field.get", pairs)
+    fields = _extract_fields_list(js)
+    out: List[Dict[str, Any]] = []
+    for f in fields:
+        try:
+            if f.get("IS_REQUIRED") == "Y":
+                code = f.get("ID")
+                if code and code != "NAME":
+                    out.append({"ID": code, "MULTIPLE": f.get("MULTIPLE", "N"), "NAME": f.get("NAME", "")})
+        except Exception:
+            continue
+    return out
+
+def find_field_code_by_name(name_exact: str) -> Optional[str]:
+    """Фоллбек: найти код поля по его имени (например, 'ID услуги')."""
+    pairs = [("IBLOCK_TYPE_ID", "lists"), ("IBLOCK_ID", str(LIST_ID))]
+    js = bx_post_form("lists.field.get", pairs)
+    fields = _extract_fields_list(js)
+    for f in fields:
+        if str(f.get("NAME", "")).strip().lower() == name_exact.strip().lower():
+            return f.get("ID")
+    return None
 
 def get_element_subset(eid: int, req_fields: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Читает NAME и требуемые поля, возвращает {'NAME':..., 'PROPERTY_XXX': <str|list> , ...}."""
@@ -171,11 +198,12 @@ def get_element_subset(eid: int, req_fields: List[Dict[str, Any]]) -> Dict[str, 
         code = f["ID"]
         pairs.append(("select[]", code))
         pairs.append(("select[]", f"{code}_VALUE"))
-    # также запросим поле даты на всякий случай (не обязательно, но дёшево)
+    # и поле даты (на всякий)
     pairs.extend([("select[]", DATE_PROP), ("select[]", f"{DATE_PROP}_VALUE")])
 
     js = bx_post_form("lists.element.get", pairs)
-    el = (js.get("result") or [None])[0] or {}
+    el = (js.get("result") or [None])[0] if isinstance(js, dict) else (js[0] if js else None)
+    el = el or {}
     out: Dict[str, Any] = {"NAME": el.get("NAME") or f"ID {eid}"}
     for f in req_fields:
         code = f["ID"]
@@ -186,18 +214,17 @@ def get_element_subset(eid: int, req_fields: List[Dict[str, Any]]) -> Dict[str, 
 
 # ========= Обновление элемента =========
 def _pairs_for_field(code: str, value: Any) -> List[Tuple[str, str]]:
-    """Генерирует пары form-data для одиночных и множественных значений: fields[CODE]=... или fields[CODE][i]=..."""
+    """fields[CODE]=... или fields[CODE][i]=... (для множественных)."""
     pairs: List[Tuple[str, str]] = []
     if isinstance(value, (list, tuple)):
         for i, v in enumerate(value):
-            if v in (None, ""): 
+            if v in (None, ""):
                 continue
             pairs.append((f"fields[{code}][{i}]", str(v)))
     elif isinstance(value, dict):
-        # крайне редко сюда попадём; на всякий — разложим значения
         i = 0
         for v in value.values():
-            if v in (None, ""): 
+            if v in (None, ""):
                 continue
             pairs.append((f"fields[{code}][{i}]", str(v)))
             i += 1
@@ -206,25 +233,43 @@ def _pairs_for_field(code: str, value: Any) -> List[Tuple[str, str]]:
             pairs.append((f"fields[{code}]", str(value)))
     return pairs
 
-def update_element_with_required(eid: int, date_ddmmyyyy: str, req_fields_meta: List[Dict[str, Any]]) -> bool:
-    """Подтягивает значения обязательных полей + NAME и делает апдейт с новой датой."""
-    snapshot = get_element_subset(eid, req_fields_meta)  # {'NAME':..., 'PROPERTY_204': <...>, ...}
-
+def update_element_with_snapshot(eid: int, date_ddmmyyyy: str, snapshot: Dict[str, Any]) -> bool:
     pairs: List[Tuple[str, str]] = [
         ("IBLOCK_TYPE_ID", "lists"),
         ("IBLOCK_ID", str(LIST_ID)),
         ("ELEMENT_ID", str(eid)),
-        ("fields[NAME]", snapshot["NAME"]),
+        ("fields[NAME]", snapshot.get("NAME") or f"ID {eid}"),
         (f"fields[{DATE_PROP}]", date_ddmmyyyy),
     ]
-    # добавим обязательные как есть
     for k, v in snapshot.items():
         if k == "NAME":
             continue
         pairs.extend(_pairs_for_field(k, v))
-
     js = bx_post_form("lists.element.update", pairs)
-    return bool(js.get("result") is True)
+    return bool(isinstance(js, dict) and js.get("result") is True)
+
+def update_element_full(eid: int, date_ddmmyyyy: str, req_fields_meta: Optional[List[Dict[str, Any]]]) -> bool:
+    """Главный апдейт: читаем NAME+обязательные, отправляем их + дату. С фоллбеком на 'ID услуги'."""
+    meta = req_fields_meta or []
+    try:
+        snapshot = get_element_subset(eid, meta)
+        if update_element_with_snapshot(eid, date_ddmmyyyy, snapshot):
+            return True
+    except Exception as e:
+        # Если не смогли прочитать обязательные — пойдём дальше к фоллбеку
+        log.warning("Не удалось собрать снапшот обязательных полей для %s: %s", eid, e)
+
+    # Фоллбек: если сервер всё ещё просит «ID услуги» — подтащим только его + NAME
+    try:
+        code = find_field_code_by_name("ID услуги")
+        if code:
+            snapshot = get_element_subset(eid, [{"ID": code, "MULTIPLE": "N", "NAME": "ID услуги"}])
+            if update_element_with_snapshot(eid, date_ddmmyyyy, snapshot):
+                return True
+    except Exception as e:
+        log.warning("Фоллбек по 'ID услуги' не сработал для %s: %s", eid, e)
+
+    return False
 
 # ========= Основной цикл =========
 def run_update_for_all() -> Dict[str, Any]:
@@ -235,22 +280,23 @@ def run_update_for_all() -> Dict[str, Any]:
     target = last_day_of_current_month_moscow_ddmmyyyy()
     ok, fail = 0, 0
 
-    # Снимем список обязательных полей один раз
+    # 1) Попробуем получить список обязательных полей один раз
+    req_fields_meta: List[Dict[str, Any]] = []
     try:
         req_fields_meta = get_required_field_codes()
         log.info("Обязательные поля: %s", [f["ID"] for f in req_fields_meta])
     except Exception as e:
         log.error("Не удалось получить список обязательных полей: %s", e)
-        req_fields_meta = []
 
+    # 2) Обновляем элементы
     for eid in ELEMENT_IDS:
         try:
-            if update_element_with_required(eid, target, req_fields_meta):
+            if update_element_full(eid, target, req_fields_meta):
                 ok += 1
                 log.info("OK: ELEMENT_ID=%s  %s=%s", eid, DATE_PROP, target)
             else:
                 fail += 1
-                log.error("FAILED (false result): ELEMENT_ID=%s", eid)
+                log.error("FAILED: ELEMENT_ID=%s (см. логи выше)", eid)
         except Exception as e:
             fail += 1
             log.error("FAILED: ELEMENT_ID=%s  error=%s", eid, e)
