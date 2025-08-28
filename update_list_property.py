@@ -1,64 +1,61 @@
 # update_list_property.py
-# Обновляет поле даты PROPERTY_202 у набора элементов списка (IBLOCK_ID),
-# уважая обязательные поля (IS_REQUIRED=Y): перед апдейтом подхватывает их текущие значения.
-# Режимы: --once (однократный запуск) или фон (ежемесячно, 1-е число в 00:01 МСК через APScheduler).
+# Обновляет поле даты (по умолчанию PROPERTY_202) у набора элементов списка Bitrix.
+# Особенности:
+# - fast_bitrix24: батчи (до 50) и троттлинг -> меньше HTTP-кругов и таймаутов
+# - Всегда «пронoсит» обязательные поля (IS_REQUIRED=Y) и NAME
+# - Дата в формате dd.mm.YYYY, конец текущего месяца по Москве
+# - Режимы: --once (однократно) или фоново (ежемесячно в 00:01 мск через APScheduler)
 
 import os
 import re
+import json
 import logging
 import calendar
+import socket
 from datetime import datetime, date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
+# --- опциональный IPv4 (снижает подвисания на некоторых хостингах/сетях)
 try:
-    from apscheduler.schedulers.background import BackgroundScheduler
-    from apscheduler.triggers.cron import CronTrigger
+    import urllib3.util.connection as urllib3_cn  # type: ignore
+    if os.getenv("FORCE_IPV4", "0").lower() in ("1", "true", "yes"):
+        urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 except Exception:
-    BackgroundScheduler = None
-    CronTrigger = None
+    pass
 
-# ========= ЛОГИ =========
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 log = logging.getLogger("update_list_property")
 
-# ========= КОНФИГ =========
-RAW_URL = os.getenv("BITRIX_OUTGOING_URL", "")
-if not RAW_URL or not re.match(r"^https?://", RAW_URL.strip()):
-    raise RuntimeError(
-        f"BITRIX_OUTGOING_URL пуст или без схемы: {RAW_URL!r}. "
-        "Ожидается вида 'https://<portal>.bitrix24.ru/rest/<id>/<token>/'"
-    )
-BITRIX_URL = RAW_URL.rstrip("/") + "/"
+# ========== ENV / конфиг ==========
+WEBHOOK = os.getenv("BITRIX_OUTGOING_URL", "").rstrip("/")
+if not WEBHOOK or not re.match(r"^https?://", WEBHOOK):
+    raise RuntimeError("BITRIX_OUTGOING_URL пуст или без схемы (жду https://.../rest/<id>/<token>/)")
+WEBHOOK += "/"
 
-def _env_int(*keys: str, default: int = 0) -> int:
-    for k in keys:
-        v = os.getenv(k)
-        if v is not None and str(v).strip() != "":
-            try:
-                return int(v)
-            except Exception:
-                pass
-    return default
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    try:
+        return int(v) if v not in (None, "") else default
+    except Exception:
+        return default
 
-LIST_ID = _env_int("BITRIX_LIST_ID", "LIST_ID", default=68)
+IBLOCK_ID = _env_int("BITRIX_LIST_ID", 68)
 
-def _normalize_prop_code(raw: Optional[str], fallback: str = "PROPERTY_202") -> str:
-    s = (raw or fallback).strip()
+def _normalize_prop_code(s: Optional[str], fallback: str = "PROPERTY_202") -> str:
+    if not s:
+        return fallback
+    s = s.strip()
     if s.isdigit():
         return f"PROPERTY_{s}"
-    up = s.upper()
-    if up == "NAME":
+    su = s.upper()
+    if su == "NAME":
         return "NAME"
-    if not up.startswith("PROPERTY_"):
+    if not su.startswith("PROPERTY_"):
         return "PROPERTY_" + s.strip("_").upper()
-    return up
+    return su
 
-DATE_PROP = _normalize_prop_code(os.getenv("BITRIX_PROPERTY_CODE", os.getenv("DATE_PROP", "PROPERTY_202")))
+DATE_PROP = _normalize_prop_code(os.getenv("BITRIX_PROPERTY_CODE") or os.getenv("DATE_PROP"), "PROPERTY_202")
 
 def _parse_ids(raw: Optional[str]) -> List[int]:
     if not raw:
@@ -66,40 +63,20 @@ def _parse_ids(raw: Optional[str]) -> List[int]:
     raw = raw.strip()
     if raw.startswith("["):
         try:
-            import json
             return [int(x) for x in json.loads(raw)]
         except Exception:
             pass
     return [int(x) for x in re.split(r"[,\s]+", raw) if x]
 
-ELEMENT_IDS: List[int] = _parse_ids(os.getenv("BITRIX_ELEMENT_IDS") or os.getenv("ELEMENT_IDS") or "")
+ELEMENT_IDS = _parse_ids(os.getenv("BITRIX_ELEMENT_IDS") or os.getenv("ELEMENT_IDS") or "")
 
-# ========= HTTP (ретраи/таймауты) =========
-CONNECT_TIMEOUT = float(os.getenv("BITRIX_CONNECT_TIMEOUT", "15"))
-READ_TIMEOUT    = float(os.getenv("BITRIX_READ_TIMEOUT", "60"))
-TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
+# fast_bitrix24 параметры (настраиваемые)
+FBX_POOL = float(os.getenv("FBX_POOL", "20"))                 # request_pool_size
+FBX_RPS = float(os.getenv("FBX_RPS", "1.5"))                  # requests_per_second
+FBX_BATCH = int(os.getenv("FBX_BATCH", "50"))                 # batch_size (макс 50 у Bitrix)
+FBX_OPTL = int(os.getenv("FBX_OPTL", "300"))                  # operating_time_limit сек
 
-RETRY_TOTAL   = int(os.getenv("BITRIX_RETRY_TOTAL", "6"))
-RETRY_CONNECT = int(os.getenv("BITRIX_RETRY_CONNECT", str(RETRY_TOTAL)))
-RETRY_READ    = int(os.getenv("BITRIX_RETRY_READ", str(RETRY_TOTAL)))
-BACKOFF       = float(os.getenv("BITRIX_BACKOFF", "0.8"))
-
-SESSION = requests.Session()
-SESSION.headers.update({"Connection": "close"})  # меньше залипов keep-alive
-retry = Retry(
-    total=RETRY_TOTAL,
-    connect=RETRY_CONNECT,
-    read=RETRY_READ,
-    backoff_factor=BACKOFF,
-    status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=frozenset({"GET", "POST"}),
-    raise_on_status=False,
-)
-adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
-SESSION.mount("https://", adapter)
-SESSION.mount("http://", adapter)
-
-# ========= ДАТЫ =========
+# ========== Время/даты ==========
 def _today_moscow() -> date:
     try:
         from zoneinfo import ZoneInfo  # py>=3.9
@@ -107,40 +84,24 @@ def _today_moscow() -> date:
     except Exception:
         return datetime.now().date()
 
-def last_day_of_current_month_moscow_ddmmyyyy() -> str:
+def month_end_ddmmyyyy() -> str:
     t = _today_moscow()
     last = calendar.monthrange(t.year, t.month)[1]
     d = date(t.year, t.month, last)
-    return f"{d.day:02d}.{d.month:02d}.{d.year:04d}"  # dd.mm.YYYY
+    return f"{d.day:02d}.{d.month:02d}.{d.year:04d}"
 
-# ========= REST helpers (form-data) =========
-def bx_post_form(method: str, data_pairs: List[Tuple[str, str]]) -> Any:
-    """Возвращает JSON, как отдаёт Bitrix (dict/list/bool/...). Подробно ругается при HTTP/не-JSON."""
-    url = f"{BITRIX_URL}{method}.json"
-    r = SESSION.post(url, data=data_pairs, timeout=TIMEOUT)
-    if r.status_code >= 400:
-        try:
-            js = r.json()
-        except Exception:
-            js = {"raw": r.text[:1000]}
-        raise RuntimeError(f"HTTP {r.status_code} at {method}: {js}")
-    try:
-        js = r.json()
-    except Exception as e:
-        raise RuntimeError(f"Non-JSON response at {method}: {r.text[:500]}") from e
-    if isinstance(js, dict) and "error" in js:
-        raise RuntimeError(f"Bitrix error at {method}: {js.get('error_description') or js.get('error')}")
-    return js
+# ========== fast_bitrix24 ==========
+from fast_bitrix24 import Bitrix  # type: ignore
 
-# ========= Утилиты разбора ответов =========
-def _extract_fields_list(js: Any) -> List[Dict[str, Any]]:
+def _extract_fields_list(raw: Any) -> List[Dict[str, Any]]:
     """
     Унифицирует ответ lists.field.get:
-    - {"result": [ ... ]}                    -> список
-    - {"result": {"CODE": {...}, ...}}       -> значения словаря
-    - {"fields": [ ... ]} / {"fields": {...}} -> то же
-    - [ ... ]                                 -> список
+    - {"result":[...]} -> список
+    - {"result":{"CODE":{...},...}} -> значения словаря
+    - {"fields":[...]} / {"fields":{...}} -> то же
+    - [... ] -> список
     """
+    js = raw
     if isinstance(js, dict):
         res = js.get("result")
         if isinstance(res, list):
@@ -156,27 +117,7 @@ def _extract_fields_list(js: Any) -> List[Dict[str, Any]]:
         return js
     raise RuntimeError(f"Неожиданный ответ lists.field.get: {type(js).__name__} {str(js)[:140]}")
 
-def _value_from_element(el: Dict[str, Any], code: str) -> Optional[Any]:
-    """Достаёт значение поля из ответа lists.element.get: *_VALUE, dict{'VALUE':..} или {id: value} -> str|list."""
-    v = el.get(f"{code}_VALUE")
-    if v is not None:
-        return v
-    raw = el.get(code)
-    if isinstance(raw, dict):
-        if "VALUE" in raw:
-            return raw["VALUE"]
-        if raw:
-            # словарь значений -> если одно, вернуть строку; если несколько — список
-            try:
-                items = sorted(((int(k), val) for k, val in raw.items()), key=lambda x: x[0])
-                vals = [val for _, val in items]
-            except Exception:
-                vals = list(raw.values())
-            return vals[0] if len(vals) == 1 else vals
-    return raw
-
-# ========= Получение обязательных полей и текущих значений =========
-def _normalize_field_code_from_fields_list(code_raw: Any) -> str:
+def _norm_field_code_from_fields_list(code_raw: Any) -> str:
     s = str(code_raw).strip()
     if s.upper() == "NAME":
         return "NAME"
@@ -185,180 +126,154 @@ def _normalize_field_code_from_fields_list(code_raw: Any) -> str:
     su = s.upper()
     if su.startswith("PROPERTY_"):
         return su
-    return s  # вдруг Bitrix вернёт уже пригодный код
+    return su  # иной системный код
 
-def get_required_field_codes() -> List[Dict[str, Any]]:
-    """Возвращает [{"ID": "PROPERTY_XXX", "MULTIPLE": "Y|N", "NAME": "..."}] для IS_REQUIRED=Y (кроме NAME)."""
-    pairs = [("IBLOCK_TYPE_ID", "lists"), ("IBLOCK_ID", str(LIST_ID))]
-    js = bx_post_form("lists.field.get", pairs)
-    fields = _extract_fields_list(js)
-
-    out: List[Dict[str, Any]] = []
+def fetch_required_codes(bx: Bitrix) -> List[str]:
+    doc = bx.call("lists.field.get", {"IBLOCK_TYPE_ID":"lists","IBLOCK_ID":IBLOCK_ID}, raw=True)
+    fields = _extract_fields_list(doc)
+    codes: List[str] = []
     for f in fields:
         try:
-            raw_code = f.get("ID") or f.get("FIELD_ID")
-            code = _normalize_field_code_from_fields_list(raw_code)
-            if not code or code == "NAME":
-                continue
-            if str(f.get("IS_REQUIRED", "")).upper() == "Y":
-                out.append({
-                    "ID": code,
-                    "MULTIPLE": f.get("MULTIPLE", "N"),
-                    "NAME": f.get("NAME", ""),
-                })
+            if str(f.get("IS_REQUIRED","")).upper() == "Y":
+                code = _norm_field_code_from_fields_list(f.get("ID") or f.get("FIELD_ID"))
+                if code and code != "NAME":
+                    codes.append(code)
         except Exception:
             continue
+    # нормализуем и удалим дубли
+    codes = list(dict.fromkeys(codes))
+    log.info("Обязательные поля: %s", codes)
+    return codes
+
+def pick_value(el: Dict[str, Any], code: str):
+    """Достаёт значение поля из ответа lists.element.get: *_VALUE, {'VALUE':...} или {'123':'...'}."""
+    v = el.get(f"{code}_VALUE")
+    if v is not None:
+        return v
+    raw = el.get(code)
+    if isinstance(raw, dict):
+        if "VALUE" in raw:
+            return raw["VALUE"]
+        vals = list(raw.values())
+        return vals[0] if len(vals) == 1 else vals
+    return raw
+
+def read_elements_batch(bx: Bitrix, ids: List[int], req_codes: List[str]) -> List[Dict[str, Any]]:
+    tasks = []
+    selects = ["ID","NAME", DATE_PROP, f"{DATE_PROP}_VALUE"]
+    for c in req_codes:
+        selects.append(c)
+        selects.append(f"{c}_VALUE")
+    for eid in ids:
+        tasks.append({
+            "IBLOCK_TYPE_ID":"lists",
+            "IBLOCK_ID": IBLOCK_ID,
+            "filter": {"ID": eid},
+            "select": selects
+        })
+    results = bx.call("lists.element.get", tasks)  # список ответов (по одной записи)
+    out: List[Dict[str, Any]] = []
+    for r in results:
+        # r обычно dict {"result":[{...}], "total":1, ...} или Exception/False
+        if isinstance(r, dict) and r.get("result"):
+            rec = (r["result"] or [None])[0] or {}
+            out.append(rec)
+        else:
+            out.append({})
     return out
 
-def find_field_code_by_name(name_exact: str) -> Optional[str]:
-    """Фоллбек: найти код поля по его имени (например, 'ID услуги')."""
-    pairs = [("IBLOCK_TYPE_ID", "lists"), ("IBLOCK_ID", str(LIST_ID))]
-    js = bx_post_form("lists.field.get", pairs)
-    fields = _extract_fields_list(js)
-    for f in fields:
-        code = _normalize_field_code_from_fields_list(f.get("ID") or f.get("FIELD_ID"))
-        if code and str(f.get("NAME", "")).strip().lower() == name_exact.strip().lower():
-            return code
-    return None
-
-def get_element_subset(eid: int, req_fields: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Читает NAME и требуемые поля, возвращает {'NAME':..., 'PROPERTY_XXX': <str|list> , ...}."""
-    pairs: List[Tuple[str, str]] = [
-        ("IBLOCK_TYPE_ID", "lists"),
-        ("IBLOCK_ID", str(LIST_ID)),
-        ("filter[ID]", str(eid)),
-        ("select[]", "ID"),
-        ("select[]", "NAME"),
-    ]
-    for f in req_fields:
-        code = f["ID"]
-        pairs.append(("select[]", code))
-        pairs.append(("select[]", f"{code}_VALUE"))
-    # и поле даты (на всякий)
-    pairs.extend([("select[]", DATE_PROP), ("select[]", f"{DATE_PROP}_VALUE")])
-
-    js = bx_post_form("lists.element.get", pairs)
-    el = (js.get("result") or [None])[0] if isinstance(js, dict) else (js[0] if js else None)
-    el = el or {}
-    out: Dict[str, Any] = {"NAME": el.get("NAME") or f"ID {eid}"}
-    for f in req_fields:
-        code = f["ID"]
-        val = _value_from_element(el, code)
-        if val not in (None, ""):
-            out[code] = val
-    return out
-
-# ========= Обновление элемента =========
-def _pairs_for_field(code: str, value: Any) -> List[Tuple[str, str]]:
-    """fields[CODE]=... или fields[CODE][i]=... (для множественных)."""
-    pairs: List[Tuple[str, str]] = []
-    if isinstance(value, (list, tuple)):
-        for i, v in enumerate(value):
-            if v in (None, ""):
-                continue
-            pairs.append((f"fields[{code}][{i}]", str(v)))
-    elif isinstance(value, dict):
-        i = 0
-        for v in value.values():
-            if v in (None, ""):
-                continue
-            pairs.append((f"fields[{code}][{i}]", str(v)))
-            i += 1
-    else:
-        if value not in (None, ""):
-            pairs.append((f"fields[{code}]", str(value)))
-    return pairs
-
-def update_element_with_snapshot(eid: int, date_ddmmyyyy: str, snapshot: Dict[str, Any]) -> bool:
-    pairs: List[Tuple[str, str]] = [
-        ("IBLOCK_TYPE_ID", "lists"),
-        ("IBLOCK_ID", str(LIST_ID)),
-        ("ELEMENT_ID", str(eid)),
-        ("fields[NAME]", snapshot.get("NAME") or f"ID {eid}"),
-        (f"fields[{DATE_PROP}]", date_ddmmyyyy),
-    ]
-    for k, v in snapshot.items():
-        if k == "NAME":
+def build_update_tasks(recs: List[Dict[str, Any]], req_codes: List[str], new_date_ddmmyyyy: str) -> List[Dict[str, Any]]:
+    tasks = []
+    for rec in recs:
+        if not rec or not rec.get("ID"):
             continue
-        # ВАЖНО: не добавлять старое значение поля даты, чтобы не перезатереть новую дату
-        if k.upper() == DATE_PROP.upper():
-            continue
-        pairs.extend(_pairs_for_field(k, v))
-    js = bx_post_form("lists.element.update", pairs)
-    return bool(isinstance(js, dict) and js.get("result") is True)
+        fields: Dict[str, Any] = {
+            "NAME": rec.get("NAME") or f"ID {rec.get('ID')}",
+            DATE_PROP: new_date_ddmmyyyy
+        }
+        for c in req_codes:
+            if c.upper() == DATE_PROP.upper():
+                continue  # не затираем новую дату
+            v = pick_value(rec, c)
+            if v not in (None, ""):
+                fields[c] = v
+        tasks.append({
+            "IBLOCK_TYPE_ID":"lists",
+            "IBLOCK_ID": IBLOCK_ID,
+            "ELEMENT_ID": rec["ID"],
+            "fields": fields
+        })
+    return tasks
 
-def update_element_full(eid: int, date_ddmmyyyy: str, req_fields_meta: Optional[List[Dict[str, Any]]]) -> bool:
-    """Главный апдейт: читаем NAME+обязательные, отправляем их + дату. С фоллбеком на 'ID услуги'."""
-    meta = req_fields_meta or []
-    try:
-        snapshot = get_element_subset(eid, meta)
-        if update_element_with_snapshot(eid, date_ddmmyyyy, snapshot):
-            return True
-    except Exception as e:
-        log.warning("Не удалось собрать/отправить обязательные поля для %s: %s", eid, e)
+def update_batch(bx: Bitrix, upd_tasks: List[Dict[str, Any]]) -> int:
+    if not upd_tasks:
+        return 0
+    results = bx.call("lists.element.update", upd_tasks)
+    ok = 0
+    for r in results:
+        # r может быть True, или {"result":true}, или Exception
+        if r is True:
+            ok += 1
+        elif isinstance(r, dict) and r.get("result") is True:
+            ok += 1
+    return ok
 
-    # Фоллбек: если сервер всё ещё просит «ID услуги» — подтащим только его + NAME
-    try:
-        code = find_field_code_by_name("ID услуги")
-        if code:
-            snapshot = get_element_subset(eid, [{"ID": code, "MULTIPLE": "N", "NAME": "ID услуги"}])
-            if update_element_with_snapshot(eid, date_ddmmyyyy, snapshot):
-                return True
-    except Exception as e:
-        log.warning("Фоллбек по 'ID услуги' не сработал для %s: %s", eid, e)
-
-    return False
-
-# ========= Основной цикл =========
-def run_update_for_all() -> Dict[str, Any]:
+def run_once() -> Dict[str, Any]:
     if not ELEMENT_IDS:
         log.warning("BITRIX_ELEMENT_IDS пуст — нечего обновлять.")
         return {"updated": 0, "failed": 0, "value": None}
 
-    target = last_day_of_current_month_moscow_ddmmyyyy()
-    ok, fail = 0, 0
+    bx = Bitrix(
+        WEBHOOK,
+        request_pool_size=int(FBX_POOL),
+        requests_per_second=float(FBX_RPS),
+        batch_size=int(FBX_BATCH),
+        operating_time_limit=int(FBX_OPTL),
+    )
 
-    # 1) Попробуем получить список обязательных полей один раз
-    req_fields_meta: List[Dict[str, Any]] = []
-    try:
-        req_fields_meta = get_required_field_codes()
-        log.info("Обязательные поля: %s", [f["ID"] for f in req_fields_meta])
-    except Exception as e:
-        log.error("Не удалось получить список обязательных полей: %s", e)
+    # 1) обязательные поля
+    req_codes = fetch_required_codes(bx)
 
-    # 2) Обновляем элементы
-    for eid in ELEMENT_IDS:
-        try:
-            if update_element_full(eid, target, req_fields_meta):
-                ok += 1
-                log.info("OK: ELEMENT_ID=%s  %s=%s", eid, DATE_PROP, target)
-            else:
-                fail += 1
-                log.error("FAILED: ELEMENT_ID=%s (см. логи выше)", eid)
-        except Exception as e:
-            fail += 1
-            log.error("FAILED: ELEMENT_ID=%s  error=%s", eid, e)
+    # 2) читаем элементы (батч)
+    recs = read_elements_batch(bx, ELEMENT_IDS, req_codes)
 
-    return {"updated": ok, "failed": fail, "value": target}
+    # 3) готовим апдейты
+    new_value = month_end_ddmmyyyy()
+    upd_tasks = build_update_tasks(recs, req_codes, new_value)
 
-# ========= Планировщик =========
+    # 4) шлём апдейты (батч, порциями по 50 fast_bitrix24 сделает сам)
+    ok = update_batch(bx, upd_tasks)
+    failed = len(upd_tasks) - ok
+
+    # 5) лог по каждому (для читабельности)
+    for rec in recs:
+        eid = rec.get("ID")
+        if not eid:
+            continue
+        if str(eid) in [str(t["ELEMENT_ID"]) for t in upd_tasks][:ok]:
+            log.info("OK: ELEMENT_ID=%s  %s=%s", eid, DATE_PROP, new_value)
+    log.info("Done: {'updated': %s, 'failed': %s, 'value': '%s'}", ok, failed, new_value)
+    return {"updated": ok, "failed": failed, "value": new_value}
+
+# ========== Планировщик ==========
 def schedule_job():
-    if BackgroundScheduler is None or CronTrigger is None:
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler  # noqa
+        from apscheduler.triggers.cron import CronTrigger  # noqa
+    except Exception:
         log.error("APScheduler не установлен. Установи APScheduler или запусти с --once.")
         return
-
     sched = BackgroundScheduler(timezone="Europe/Moscow")
-    trigger = CronTrigger(day="1", hour="0", minute="1")  # 1-е число, 00:01 мск
-    sched.add_job(run_update_for_all, trigger, id="lists-month-end", replace_existing=True)
+    # 1-е число каждого месяца в 00:01 МСК
+    trigger = CronTrigger(day="1", hour="0", minute="1")
+    sched.add_job(run_once, trigger, id="lists-month-end", replace_existing=True)
     sched.start()
-    log.info("Ежемесячная задача запущена (00:01 мск, 1 число).")
+    log.info("Ежемесячная задача запущена (00:01 мск, 1 число). Дата будет установлена в конец текущего месяца.")
 
-# ========= CLI =========
 if __name__ == "__main__":
     import sys, time
     if "--once" in sys.argv:
-        res = run_update_for_all()
-        log.info("Done: %s", res)
+        run_once()
     else:
         schedule_job()
         while True:
