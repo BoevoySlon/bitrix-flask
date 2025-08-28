@@ -1,134 +1,198 @@
-# scripts/update_list_property.py
-import os, sys, logging, calendar, json
+# update_list_property.py
+import os
+import re
+import logging
+import calendar
 from datetime import datetime, date
-from zoneinfo import ZoneInfo
+from typing import Any, Dict, List, Optional
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
 try:
+    # Планировщик для фонового режима (вариант с отдельным воркером)
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
-except ImportError:
+except Exception:
     BackgroundScheduler = None
+    CronTrigger = None
 
+# ===== ЛОГИРОВАНИЕ =====
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("monthly-list-updater")
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+log = logging.getLogger("update_list_property")
 
-BITRIX_BASE = os.environ["BITRIX_OUTGOING_URL"].rstrip("/") + "/"
-LIST_ID = int(os.getenv("BITRIX_LIST_ID", "68"))
-# Можно передать: "123,456,789" или JSON: "[123,456,789]"
-TARGET_IDS_RAW = os.getenv("BITRIX_ELEMENT_IDS", "")
-PROP_RAW = os.getenv("BITRIX_PROPERTY_CODE", "PROPERTY_202")
-CONNECT_TIMEOUT = float(os.getenv("BITRIX_CONNECT_TIMEOUT", "8"))
-READ_TIMEOUT = float(os.getenv("BITRIX_READ_TIMEOUT", "30"))
-RETRY_TOTAL = int(os.getenv("BITRIX_RETRY_TOTAL", "6"))
-RETRY_CONNECT = int(os.getenv("BITRIX_RETRY_CONNECT", "6"))
-RETRY_READ = int(os.getenv("BITRIX_RETRY_READ", "6"))
-BACKOFF = float(os.getenv("BITRIX_BACKOFF", "0.8"))
+# ===== КОНФИГ =====
+BITRIX_URL = os.getenv("BITRIX_OUTGOING_URL", "").rstrip("/") + "/"
 
-def _parse_ids(raw: str):
-    raw = raw.strip()
+# Поддержим оба варианта переменных окружения для совместимости
+def _env_int(*keys: str, default: int = 0) -> int:
+    for k in keys:
+        v = os.getenv(k)
+        if v is not None and str(v).strip() != "":
+            try:
+                return int(v)
+            except Exception:
+                pass
+    return default
+
+LIST_ID = _env_int("BITRIX_LIST_ID", "LIST_ID", default=68)
+
+def _normalize_prop_code(raw: Optional[str], fallback: str = "PROPERTY_202") -> str:
+    s = (raw or fallback).strip()
+    if s.isdigit():
+        return f"PROPERTY_{s}"
+    if not s.upper().startswith("PROPERTY_"):
+        return "PROPERTY_" + s.strip("_").upper()
+    return s.upper()
+
+DATE_PROP = _normalize_prop_code(os.getenv("BITRIX_PROPERTY_CODE", os.getenv("DATE_PROP", "PROPERTY_202")))
+# Список ELEMENT_ID можно передать строкой "1,2,3" или JSON "[1,2,3]"
+def _parse_ids(raw: Optional[str]) -> List[int]:
     if not raw:
         return []
-    try:
-        if raw.startswith("["):
-            return [int(x) for x in json.loads(raw)]
-    except Exception:
-        pass
-    return [int(x.strip()) for x in raw.split(",") if x.strip()]
-
-def _normalize_prop(code: str) -> str:
-    code = code.strip()
-    if code.isdigit():
-        return f"PROPERTY_{code}"
-    if not code.upper().startswith("PROPERTY_"):
-        return "PROPERTY_" + code.strip("_").upper()
-    return code.upper()
-
-TARGET_IDS = _parse_ids(TARGET_IDS_RAW)
-PROP_CODE = _normalize_prop(PROP_RAW)
-
-def _requests_session():
-    sess = requests.Session()
-    retry = Retry(
-        total=RETRY_TOTAL,
-        connect=RETRY_CONNECT,
-        read=RETRY_READ,
-        backoff_factor=BACKOFF,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset(["POST", "GET"])
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    sess.mount("https://", adapter)
-    sess.mount("http://", adapter)
-    return sess
-
-def _last_day_of_current_month_moscow() -> date:
-    tz = ZoneInfo("Europe/Moscow")
-    today = datetime.now(tz).date()
-    last_day = calendar.monthrange(today.year, today.month)[1]
-    return date(today.year, today.month, last_day)
-
-def _bitrix_call(method: str, payload: dict):
-    url = f"{BITRIX_BASE}{method}.json"
-    sess = _requests_session()
-    # По Bitrix REST формату обновления полей массив передаётся как fields/FIELDS
-    # оставим обе записи на случай различий в методах
-    resp = sess.post(url, json=payload, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-    resp.raise_for_status()
-    data = resp.json()
-    if "error" in data:
-        raise RuntimeError(f"Bitrix error {data.get('error')}: {data.get('error_description')}")
-    return data.get("result", data)
-
-def update_elements_to_month_end():
-    if not TARGET_IDS:
-        log.warning("Переменная BITRIX_ELEMENT_IDS не задана — нечего обновлять.")
-        return {"updated": 0, "skipped": 0}
-
-    target_date = _last_day_of_current_month_moscow().isoformat()  # YYYY-MM-DD
-    updated, skipped = 0, 0
-    for eid in TARGET_IDS:
+    raw = raw.strip()
+    if raw.startswith("["):
         try:
-            payload = {
-                "IBLOCK_TYPE_ID": "lists",
-                "IBLOCK_ID": LIST_ID,
-                "ELEMENT_ID": eid,
-                "FIELDS": {PROP_CODE: target_date},
-                "fields": {PROP_CODE: target_date},
-            }
-            _bitrix_call("lists.element.update", payload)
-            updated += 1
-            log.info("ELEMENT_ID=%s -> %s=%s [OK]", eid, PROP_CODE, target_date)
+            import json
+            return [int(x) for x in json.loads(raw)]
+        except Exception:
+            pass
+    return [int(x) for x in re.split(r"[,\s]+", raw) if x]
+
+ELEMENT_IDS_RAW = os.getenv("BITRIX_ELEMENT_IDS") or os.getenv("ELEMENT_IDS") or ""
+ELEMENT_IDS: List[int] = _parse_ids(ELEMENT_IDS_RAW)
+
+# Таймауты/ретраи как в твоём коде
+CONNECT_TIMEOUT = float(os.getenv("BITRIX_CONNECT_TIMEOUT", "8"))
+READ_TIMEOUT    = float(os.getenv("BITRIX_READ_TIMEOUT", "30"))
+TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
+
+RETRY_TOTAL   = int(os.getenv("BITRIX_RETRY_TOTAL", "6"))
+RETRY_CONNECT = int(os.getenv("BITRIX_RETRY_CONNECT", str(RETRY_TOTAL)))
+RETRY_READ    = int(os.getenv("BITRIX_RETRY_READ", str(RETRY_TOTAL)))
+BACKOFF       = float(os.getenv("BITRIX_BACKOFF", "0.8"))
+
+SESSION = requests.Session()
+retry = Retry(
+    total=RETRY_TOTAL,
+    connect=RETRY_CONNECT,
+    read=RETRY_READ,
+    backoff_factor=BACKOFF,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset({"GET", "POST"}),
+    raise_on_status=False,
+)
+adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
+SESSION.mount("https://", adapter)
+SESSION.mount("http://", adapter)
+
+# ===== УТИЛИТЫ ДАТЫ =====
+def _today_moscow() -> date:
+    try:
+        from zoneinfo import ZoneInfo  # py>=3.9
+        return datetime.now(ZoneInfo("Europe/Moscow")).date()
+    except Exception:
+        # Фоллбэк: берём локальную дату контейнера
+        return datetime.now().date()
+
+def last_day_of_current_month_moscow() -> str:
+    t = _today_moscow()
+    last = calendar.monthrange(t.year, t.month)[1]
+    return date(t.year, t.month, last).isoformat()  # YYYY-MM-DD
+
+# ===== ВСПОМОГАТЕЛЬНЫЕ ВЫЗОВЫ REST (form-data, как у тебя) =====
+def bx_post_form(method: str, data_pairs: List[tuple[str, str]]) -> Dict[str, Any]:
+    r = SESSION.post(f"{BITRIX_URL}{method}.json", data=data_pairs, timeout=TIMEOUT)
+    # Развёрнутая диагностика ошибок
+    if r.status_code >= 400:
+        try:
+            js = r.json()
+        except Exception:
+            js = {"raw": r.text[:1000]}
+        raise RuntimeError(f"HTTP {r.status_code} at {method}: {js}")
+    try:
+        js = r.json()
+    except Exception as e:
+        raise RuntimeError(f"Non-JSON response at {method}: {r.text[:500]}") from e
+    if isinstance(js, dict) and "error" in js:
+        raise RuntimeError(f"Bitrix error at {method}: {js.get('error_description') or js.get('error')}")
+    return js
+
+def get_element(eid: int) -> Optional[Dict[str, Any]]:
+    pairs = [
+        ("IBLOCK_TYPE_ID", "lists"),
+        ("IBLOCK_ID", str(LIST_ID)),
+        ("filter[=ID]", str(eid)),
+        ("select[]", "ID"),
+        ("select[]", "NAME"),
+    ]
+    data = bx_post_form("lists.element.get", pairs)
+    res = data.get("result")
+    if isinstance(res, list) and res:
+        return res[0]
+    return None
+
+def update_element_date(eid: int, name: str, iso_date: str) -> bool:
+    pairs: List[tuple[str, str]] = [
+        ("IBLOCK_TYPE_ID", "lists"),
+        ("IBLOCK_ID", str(LIST_ID)),
+        ("ELEMENT_ID", str(eid)),
+        ("fields[NAME]", name or f"ID {eid}"),
+        (f"fields[{DATE_PROP}]", iso_date),
+    ]
+    data = bx_post_form("lists.element.update", pairs)
+    # У lists.element.update успешный ответ обычно {"result": true}
+    return bool(data.get("result") is True)
+
+# ===== ОСНОВНАЯ ЛОГИКА =====
+def run_update_for_all() -> Dict[str, Any]:
+    if not ELEMENT_IDS:
+        log.warning("BITRIX_ELEMENT_IDS пуст — нечего обновлять.")
+        return {"updated": 0, "failed": 0, "value": None}
+
+    target = last_day_of_current_month_moscow()
+    ok, fail = 0, 0
+    for eid in ELEMENT_IDS:
+        try:
+            el = get_element(eid)
+            if not el:
+                raise RuntimeError("element not found")
+            name = el.get("NAME") or f"ID {eid}"
+            if update_element_date(eid, name, target):
+                ok += 1
+                log.info("OK: ELEMENT_ID=%s  %s=%s", eid, DATE_PROP, target)
+            else:
+                fail += 1
+                log.error("FAILED (false result): ELEMENT_ID=%s", eid)
         except Exception as e:
-            skipped += 1
-            log.error("ELEMENT_ID=%s FAILED: %s", eid, e)
-    return {"updated": updated, "skipped": skipped, "value": target_date}
+            fail += 1
+            log.error("FAILED: ELEMENT_ID=%s  error=%s", eid, e)
+    return {"updated": ok, "failed": fail, "value": target}
 
-def run_once_cli():
-    res = update_elements_to_month_end()
-    log.info("Done: %s", res)
-
-def schedule_monthly_job():
-    if BackgroundScheduler is None:
+# ===== CLI / SCHEDULER =====
+def schedule_job():
+    if BackgroundScheduler is None or CronTrigger is None:
         log.error("APScheduler не установлен. Добавь APScheduler в requirements.txt")
-        return
-    sched = BackgroundScheduler(timezone=ZoneInfo("Europe/Moscow"))
-    # 1-е число каждого месяца в 00:01 по Москве
+        # На всякий случай однократно выполним, чтобы не молчать
+        return run_update_for_all()
+
+    sched = BackgroundScheduler(timezone="Europe/Moscow")
+    # каждое 1-е число в 00:01 мск
     trigger = CronTrigger(day="1", hour="0", minute="1")
-    sched.add_job(update_elements_to_month_end, trigger, id="bitrix-list-monthly", replace_existing=True)
+    sched.add_job(run_update_for_all, trigger, id="lists-month-end", replace_existing=True)
     sched.start()
     log.info("Ежемесячная задача запущена (00:01 мск, 1 число).")
+    return None
 
 if __name__ == "__main__":
-    # Позволяет ручной запуск внутри контейнера:
-    #   python -m scripts.update_list_property --once
+    import sys, time
     if "--once" in sys.argv:
-        run_once_cli()
+        res = run_update_for_all()
+        log.info("Done: %s", res)
     else:
-        schedule_monthly_job()
-        # держим процесс (на случай отдельного запуска без gunicorn)
-        import time
+        schedule_job()
+        # держим процесс для воркера
         while True:
             time.sleep(3600)
