@@ -12,6 +12,7 @@ import json
 import logging
 import calendar
 import socket
+import fast_bitrix24
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 
